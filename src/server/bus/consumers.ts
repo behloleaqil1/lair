@@ -32,6 +32,7 @@ import type { ReportKind } from "../../bus/types.js";
 import { isValidDragonId } from "../parsers/dragon-config.js";
 import { isValidTaskId } from "../agents/types.js";
 import type { BusReport } from "./store.js";
+import { EXT_AGENT_PREFIX } from "./tokens.js";
 
 // ============ Config ============
 
@@ -181,7 +182,8 @@ export function validateBusReportEvent(data: unknown): Validated<BusReportEvent>
   const { project, id, agent, kind, task, gateId, pr, sha } = data;
   if (typeof project !== "string" || project.length === 0) return { ok: false, reason: "project is not a name" };
   if (!positiveInt(id)) return { ok: false, reason: "id is not a positive integer" };
-  if (typeof agent !== "string" || !isValidDragonId(agent)) return { ok: false, reason: "agent is not a valid agent id" };
+  // A fleet agent's id, or an external worker's `ext:<worker>` (an owner-issued token: tokens.ts)
+  if (typeof agent !== "string" || !isValidDragonId(agent.startsWith(EXT_AGENT_PREFIX) ? agent.slice(EXT_AGENT_PREFIX.length) : agent)) return { ok: false, reason: "agent is not a valid agent id" };
   if (!isReportKind(kind)) return { ok: false, reason: `kind is not one of ${REPORT_KINDS.join(", ")}` };
   if (!isValidTaskId(task)) return { ok: false, reason: "task is not a valid task id" };
   if (gateId !== undefined && (typeof gateId !== "string" || gateId.length === 0 || gateId.length > MAX_GATE_ID)) {

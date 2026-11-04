@@ -200,11 +200,62 @@ across restarts), the planner keeps the ids of the reports it handled. A report 
 A run's bus token is revoked on every way the run ends (exit, crash, failover, transient retry, never started, stopped,
 claim released), whatever `bus.consume` is by then, and at start Lair revokes the tokens of runs that ended while it
 was down. `lair bus report` is refused with 400, and nothing is stored or mirrored, when its `sha` isn't 7 to 64 hex
-digits or its `gate_id` isn't a plain name (letters, digits, `.`, `_` and `-`, starting with a letter or digit, no
-`..`). The mirror appends to `queue_file`, `inbox_file` and `mail_dir` without blocking the server, one line at a time
-per file; an owner message to a recipient that isn't a plain name gets no mailbox file.
+digits, its `gate_id` isn't a plain name (letters, digits, `.`, `_` and `-`, starting with a letter or digit, no
+`..`), or its task or `gate_id` holds a bus token. The mirror appends to `queue_file`, `inbox_file` and `mail_dir`
+without blocking the server, one line at a time per file; an owner message to a recipient that isn't a plain name gets
+no mailbox file.
 
 Turn `observe` on first, compare on Home → Health, then switch to `on`.
+
+### External worker tokens
+
+A worker that Lair doesn't run (your own session with an AI tool, its subagents, a script) has no run token. Instead of
+appending lines to `queue_file` by hand, it can report over the bus with a token you make for it:
+
+```bash
+export LAIR_OWNER_SESSION=<an owner session>   # the dashboard's, from a browser signed in as the owner
+lair bus token create --project <p> --worker <id> [--ttl 24h] [--kinds PROGRESS,WAITING,DONE,BLOCKED]
+lair bus token list --project <p>
+lair bus token revoke <token id> --project <p>
+```
+
+`create` prints the token (`lairext_` and 43 characters) once, with its id; Lair keeps only its sha256, as for run
+tokens. The worker sets it as `LAIR_BUS_TOKEN` and reports with `lair bus report` (or `POST /api/bus/call` with
+`{"tool": "report", ...}`), with no project named: the token names it. The token:
+
+- **reports only.** Every other bus tool (whoami, inbox, ack, send, board) gets 403, and the routes of fill, decisions,
+  runs, reviews and merges, which take only the owner's session, refuse it as any request without one (403). The checks
+  routes and `lair bus-mcp` take only run tokens.
+- **reports as `ext:<worker>`**, whatever the request says: never a fleet agent's id, also when the worker id is one.
+  The worker id follows the agent id rules (a letter first, then letters, digits, `_` and `-`, at most 64). The report's
+  run id is `ext:<token id>`.
+- **takes the same report path as a run's** (the same checks, the summary cleaned and every bus token in it replaced by
+  `[bus-token]`, the same mirrored line ending `[bus:<id>]`, the same `bus.report` event), so Home, fill and the planner
+  see it. There is no claim to check: it may report on any task id (1 to 128 letters, digits, `.`, `_`, `-`, `/`, `:`
+  or `#`, a letter or digit first; 400 otherwise, and for one that holds a bus token). With fill's default patterns (no `{agent}`) a `DONE` it sends for a fill
+  task counts as a hand-written `DONE` line would, so give it only the kinds it needs. A fleet agent must not be named
+  `ext`: a pattern reads `by ext:<worker>` as written by `ext`.
+- **sends only its kinds** (default `PROGRESS`, `WAITING`, `DONE` and `BLOCKED`; `TICK` only when named): another kind
+  gets 403.
+- **expires** after `--ttl` (minutes, hours or days: `90m`, `24h`, `7d`; default 24 hours, at most 30 days), or when you
+  revoke it: then 401, and nothing is stored or mirrored.
+- **is limited** to 30 calls a minute (429 past that; refused calls don't count).
+
+Every call with a known token is audited with the token's id and worker (never the token): the outcome, and for a
+report its kind and bus id; making and revoking a token are audited with the owner session's public id. Lair keeps the
+latest 10000 entries per project.
+
+The CLI sends the owner session as the dashboard does (the `X-Lair-Owner-Session` header, `LAIR_URL`'s origin,
+same-origin), so it gets exactly what the dashboard gets. The API, all with an owner session and `?project=<name>`
+(404 while the project's `bus.consume` is `off`):
+
+- `POST /api/bus/tokens` `{worker, ttl_minutes?, kinds?}`: 201 `{token, info}`, the token shown this once
+- `GET /api/bus/tokens`: the project's tokens, newest first (revoked and expired ones too, at most 200): id, worker,
+  agent, kinds, created, expires, revoked, last used and report count
+- `POST /api/bus/tokens/<id>/revoke`: 404 when there is no such token not yet revoked
+- `GET /api/bus/tokens/audit[?token=<id>]`: the latest 200 audit entries, newest first
+
+The tokens have no Settings list yet; use `lair bus token list`.
 
 ## Dragons (agents)
 
@@ -804,7 +855,7 @@ Errors: 400 for invalid input, 403 for a cross-site request or an answer without
 
 ## Owner-only routes
 
-Every route that changes something only you should change needs the owner's session, the same one the Decision Inbox uses (see "Only you answer"): the `X-Lair-Owner-Session` header, from the dashboard's own origin, in a same-origin browser request. Without it the answer is HTTP 403, before the request's body is read, and nothing changes. `curl`, scripts, agents and other local programs can still read: every `GET` stays open, except the two that read prompt files from disk (`/api/agents/prompts`), AI spend (`/api/agents/spend`), which is cost and usage, the Settings API (`/api/settings`), whose reads reveal paths and commands, the AI tools API (`/api/ai`), whose reads run the tools' own commands, the cloud machines' status (`/api/cloud`), which names the account's instances and spend, Lair's diagnostics and the ops tokens and their audit (`/api/health/diagnostics`, `/api/supervisor`), and logs and test output (`/api/dashboard/.../output` and `.../log`, and the logs in pipeline runs), which can hold anything a test or an agent printed. No CORS is granted under these prefixes (`OWNER_ONLY_PREFIXES` in `src/server/human-auth/cors.ts`). The dashboard's views send the session once this browser is signed in, and show "sign in from Decisions" until it is.
+Every route that changes something only you should change needs the owner's session, the same one the Decision Inbox uses (see "Only you answer"): the `X-Lair-Owner-Session` header, from the dashboard's own origin, in a same-origin browser request. Without it the answer is HTTP 403, before the request's body is read, and nothing changes. `curl`, scripts, agents and other local programs can still read: every `GET` stays open, except the two that read prompt files from disk (`/api/agents/prompts`), AI spend (`/api/agents/spend`), which is cost and usage, the Settings API (`/api/settings`), whose reads reveal paths and commands, the AI tools API (`/api/ai`), whose reads run the tools' own commands, the cloud machines' status (`/api/cloud`), which names the account's instances and spend, Lair's diagnostics and the ops tokens and their audit (`/api/health/diagnostics`, `/api/supervisor`), the external worker tokens and their audit (`/api/bus/tokens`), and logs and test output (`/api/dashboard/.../output` and `.../log`, and the logs in pipeline runs), which can hold anything a test or an agent printed. No CORS is granted under these prefixes (`OWNER_ONLY_PREFIXES` in `src/server/human-auth/cors.ts`). The dashboard's views send the session once this browser is signed in, and show "sign in from Decisions" until it is.
 
 | Prefix | Owner only | Open |
 |--------|------------|------|
@@ -814,6 +865,7 @@ Every route that changes something only you should change needs the owner's sess
 | `/api/agents` | starting a run, releasing a claim, a fresh session, an early check, listing and reading prompt files, AI spend (`/api/agents/spend`, `/api/agents/spend/runs`) | status, runs, recoveries |
 | `/api/controls` | every `POST`: ask, instruct, tick, pause, resume, agent run/stop/release, gate submit/stuck, merge, dragon start/stop | status, inbox, audit, dragon config |
 | `/api/bus/send` | sending a message (it is sent as `owner`) | the board and the event stream (`/api/bus/board`, `/api/bus/events`) |
+| `/api/bus/tokens` | everything: making, listing and revoking [external worker tokens](#external-worker-tokens), their audit | nothing |
 | `/api/processes` | start, stop, restart | the list, a process, its logs |
 | `/api/settings` | everything: reading, checking and saving project settings, their history and restore, creating a project, the repository check, testing a machine | nothing |
 | `/api/scheduler`, `/api/tasks` | scheduler start, stop and tick; creating, cancelling and retrying tasks | status, tasks, jobs, nodes |
@@ -2100,8 +2152,9 @@ Triage ([design](design/autonomy.md#3-failure-triage-bisect-and-revert-module-tr
 
 **Where results come from.** Every local process can reach the server, including the agents whose work triage judges, so triage only believes results from a trusted source:
 
-- **In-process (trusted):** the gate pipelines (`pipelines:`, [Gate pipelines](#gate-pipelines)) hand over each finished job's result as a `gate.completed` event, with its run id (which answers a re-check that started that run). Only in-process results may name the author agent, the PR and the base commit. The pipelines send neither the test reports nor the agent yet: their failures are read from the steps' console output and are not routed to an agent.
-- **Signed (over HTTP):** `POST /api/triage/results` takes only a `SignedGateResult` from a node listed in `trusted_nodes` (its Ed25519 public key file), verified with the gates module's signature check. Test reports must be covered by the signature: the signed result lists each report's SHA-256 in `result.reports`. Only `recheckId` is read from the rest of the body: the base commit comes from `git merge-base`, the changed files from `git diff`, and no agent is routed to.
+- **In-process (trusted):** the gate pipelines (`pipelines:`, [Gate pipelines](#gate-pipelines)) hand over each finished job's result as a `gate.completed` event, with its run id (which answers a re-check that started that run). Only in-process results may name the author agent, the PR and the base commit (with `external_author` on, a result that names no agent may get one from the tasks file, below). The pipelines send neither the test reports nor the agent yet: their failures are read from the steps' console output and are not routed to an agent (unless `external_author` is on, below).
+- **Signed (over HTTP):** `POST /api/triage/results` takes only a `SignedGateResult` from a node listed in `trusted_nodes` (its Ed25519 public key file), verified with the gates module's signature check. Test reports must be covered by the signature: the signed result lists each report's SHA-256 in `result.reports`. Only `recheckId` is read from the rest of the body: the base commit comes from `git merge-base`, the changed files from `git diff`, and no agent is routed to (unless `external_author` is on, below).
+- **The author of a result that names none** (`external_author: tasks_file`, off by default): for a change's failed gate run with no agent (a signed result, or an in-process one without `context.agent`), the author is the agent of the one open line of `agents.fill`'s tasks file that names the result: its task id is the whole branch, or its task id is the branch's last path segment and an earlier segment is the line's agent (`kiro/<agent>/<task>`). A line whose task id is only the branch's last segment (another agent's `<prefix>/<task>`, e.g. after a takeover), only the pipeline (a line `e2e` would name every e2e failure), or whose description has the branch as a whole word (a review line is not the author) also names the result, so it makes the match ambiguous, but it never picks the author on its own. Open means fill's last check saw the line started or held. Only the tasks file is read (never the queue, bus reports or a WAITING line's wake, which agents write), and only while fill runs, when its last check read it without an error less than two fill intervals ago, and when its real path (after symlinks) is outside the project's repository. No such line, a line that names it only by last segment, pipeline or description, or two or more lines, routes the failure to the owner: one Decision Inbox question per commit. In `observe` both are only recorded (`planned`, with the matched agent or "the owner"), and a note on the result says which line matched or why none did.
 - An unsigned result, a tampered one, one from an untrusted node, or one signed for another project gets HTTP 403.
 - **The branch is a label.** A result for `default_branch` counts as that branch's run only when its commit is in the branch's history (the local branch, or a remote's branch of exactly that name). Otherwise it is triaged as a change, with a note. A green run ends an incident only at a commit that contains the red one.
 
@@ -2174,6 +2227,7 @@ The built-in root-cause signatures (case-insensitive; each line is cut to 1,000 
 | `default_context_patterns` | boolean | `true` | Use the built-in context patterns too |
 | `overload_per_core` | number | `2` | A timeout while a trusted result's `context.loadPerCore` was at least this is `infra` (`load`) |
 | `base_max_age_hours` | number | `72` | A base commit's gate run older than this is not used to call a failure pre-existing |
+| `external_author` | `off` \| `tasks_file` | `off` | A failure whose result names no agent: `tasks_file` routes it to the agent of the one open `agents.fill` tasks file line that names it, else to the owner (see "The author of a result that names none" above) |
 | `actions.infra` | `recheck` \| `route` \| `none` | `recheck` | |
 | `actions.pre_existing` | `fix_task` \| `none` | `fix_task` | |
 | `actions.code` | `route` \| `none` | `route` | |

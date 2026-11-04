@@ -16,11 +16,11 @@ import { access } from "fs/promises";
 import { dirname, join } from "path";
 import { randomUUID } from "crypto";
 import type { ReportKind } from "../../bus/types.js";
-import type { BusTokenBinding } from "./tokens.js";
+import { EXT_AGENT_PREFIX, type BusTokenBinding, type ExtTokenBinding } from "./tokens.js";
 
 // ============ Schema ============
 
-export const BUS_SCHEMA_VERSION = 1;
+export const BUS_SCHEMA_VERSION = 2;
 
 const BUS_SCHEMA = `
   -- Schema version
@@ -75,7 +75,62 @@ const BUS_SCHEMA = `
   CREATE INDEX IF NOT EXISTS idx_bus_messages_from ON bus_messages(project, from_id, created_at);
 `;
 
+/** Version 2, also added to a store made before it: external worker tokens (hash only) and their audit */
+const EXT_SCHEMA = `
+  CREATE TABLE IF NOT EXISTS bus_ext_tokens (
+    id TEXT PRIMARY KEY,
+    token_hash TEXT NOT NULL UNIQUE,
+    project TEXT NOT NULL,
+    worker TEXT NOT NULL,
+    kinds TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    expires_at INTEGER NOT NULL,
+    revoked_at INTEGER,
+    last_used_at INTEGER,
+    reports INTEGER NOT NULL DEFAULT 0
+  );
+  -- Each use of one: the token's id and its worker, never the token
+  CREATE TABLE IF NOT EXISTS bus_ext_audit (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    project TEXT NOT NULL,
+    at INTEGER NOT NULL,
+    token_id TEXT NOT NULL,
+    worker TEXT NOT NULL,
+    action TEXT NOT NULL,
+    outcome TEXT NOT NULL,
+    detail TEXT NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS idx_bus_ext_audit_token ON bus_ext_audit(project, token_id, id);
+  INSERT OR IGNORE INTO bus_schema (version) VALUES (2);
+`;
+
+/** Audit entries kept per store: older ones are dropped as new ones come */
+const EXT_AUDIT_KEEP = 10_000;
+
 // ============ Types ============
+
+/** An external worker's token as the owner's list shows it: never the token or its hash */
+export interface ExtTokenView {
+  id: string;
+  worker: string;
+  agent: string;
+  kinds: ReportKind[];
+  createdAt: string;
+  expiresAt: string;
+  revokedAt: string | null;
+  lastUsedAt: string | null;
+  reports: number;
+}
+
+/** One use of an external worker's token, as audited: its id and worker, never the token */
+export interface ExtAuditEntry {
+  at: number;
+  tokenId: string;
+  worker: string;
+  action: string;
+  outcome: "ok" | "refused";
+  detail: string;
+}
 
 export interface BusReport {
   id: number;
@@ -191,6 +246,33 @@ function toTokenBinding(row: TokenRow): BusTokenBinding {
   };
 }
 
+interface ExtTokenRow {
+  id: string;
+  project: string;
+  worker: string;
+  kinds: string;
+  created_at: number;
+  expires_at: number;
+  revoked_at: number | null;
+  last_used_at: number | null;
+  reports: number;
+}
+
+function toExtView(row: ExtTokenRow): ExtTokenView {
+  const iso = (ms: number) => new Date(ms).toISOString();
+  return {
+    id: row.id,
+    worker: row.worker,
+    agent: EXT_AGENT_PREFIX + row.worker,
+    kinds: row.kinds.split(",") as ReportKind[],
+    createdAt: iso(row.created_at),
+    expiresAt: iso(row.expires_at),
+    revokedAt: row.revoked_at === null ? null : iso(row.revoked_at),
+    lastUsedAt: row.last_used_at === null ? null : iso(row.last_used_at),
+    reports: row.reports,
+  };
+}
+
 // ============ Store ============
 
 export class BusStore {
@@ -216,11 +298,8 @@ export class BusStore {
 
   private migrate(): void {
     const row = this.db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='bus_schema'").get();
-    if (!row) {
-      this.db.exec(BUS_SCHEMA);
-      return;
-    }
-    // Future migrations would go here based on version
+    if (!row) this.db.exec(BUS_SCHEMA);
+    this.db.exec(EXT_SCHEMA);
   }
 
   close(): void {
@@ -289,6 +368,67 @@ export class BusStore {
       .prepare(`SELECT * FROM bus_tokens WHERE project = ? AND run_id = ? AND revoked_at IS NULL ORDER BY issued_at DESC LIMIT 1`)
       .get(this.project, runId) as TokenRow | undefined;
     return row ? toTokenBinding(row) : null;
+  }
+
+  // ============ External worker tokens ============
+
+  /** Store an external worker's token (its hash only); the caller shows the token once. */
+  issueExtToken(worker: string, kinds: ReportKind[], tokenHash: string, at: number, expiresAt: number): ExtTokenView {
+    const row: ExtTokenRow = { id: randomUUID(), project: this.project, worker, kinds: kinds.join(","), created_at: at, expires_at: expiresAt, revoked_at: null, last_used_at: null, reports: 0 };
+    this.db
+      .prepare(`INSERT INTO bus_ext_tokens (id, token_hash, project, worker, kinds, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?)`)
+      .run(row.id, tokenHash, row.project, row.worker, row.kinds, row.created_at, row.expires_at);
+    return toExtView(row);
+  }
+
+  /** An external worker's token by its hash while it is neither revoked nor expired at `at`, else null. */
+  validateExtToken(tokenHash: string, at: number): ExtTokenBinding | null {
+    const row = this.db
+      .prepare(`SELECT * FROM bus_ext_tokens WHERE token_hash = ? AND project = ? AND revoked_at IS NULL`)
+      .get(tokenHash, this.project) as ExtTokenRow | undefined;
+    if (!row || at >= row.expires_at) return null;
+    const view = toExtView(row);
+    return { id: row.id, project: row.project, worker: row.worker, agent: view.agent, kinds: view.kinds, expiresAt: row.expires_at };
+  }
+
+  /** Revoke an external worker's token by its id: its worker, or null when it has no such token not yet revoked. */
+  revokeExtToken(id: string, at: number): string | null {
+    const row = this.db
+      .prepare(`SELECT worker FROM bus_ext_tokens WHERE id = ? AND project = ? AND revoked_at IS NULL`)
+      .get(id, this.project) as { worker: string } | undefined;
+    if (!row) return null;
+    this.db.prepare(`UPDATE bus_ext_tokens SET revoked_at = ? WHERE id = ?`).run(at, id);
+    return row.worker;
+  }
+
+  /** The project's external worker tokens, newest first, revoked and expired ones too (at most 200). */
+  listExtTokens(): ExtTokenView[] {
+    const rows = this.db
+      .prepare(`SELECT * FROM bus_ext_tokens WHERE project = ? ORDER BY created_at DESC, rowid DESC LIMIT 200`)
+      .all(this.project) as ExtTokenRow[];
+    return rows.map(toExtView);
+  }
+
+  /** Count a report an external worker's token sent. */
+  countExtReport(id: string, at: number): void {
+    this.db.prepare(`UPDATE bus_ext_tokens SET reports = reports + 1, last_used_at = ? WHERE id = ?`).run(at, id);
+  }
+
+  /** Audit one use of an external worker's token; the oldest entries past EXT_AUDIT_KEEP are dropped. */
+  auditExt(entry: ExtAuditEntry): void {
+    const result = this.db
+      .prepare(`INSERT INTO bus_ext_audit (project, at, token_id, worker, action, outcome, detail) VALUES (?, ?, ?, ?, ?, ?, ?)`)
+      .run(this.project, entry.at, entry.tokenId, entry.worker, entry.action.slice(0, 50), entry.outcome, entry.detail.slice(0, 500));
+    this.db.prepare(`DELETE FROM bus_ext_audit WHERE id <= ?`).run(Number(result.lastInsertRowid) - EXT_AUDIT_KEEP);
+  }
+
+  /** The latest audit entries, newest first: every token's, or one token's. */
+  listExtAudit(limit: number, tokenId?: string): ExtAuditEntry[] {
+    const where = tokenId === undefined ? "project = ?" : "project = ? AND token_id = ?";
+    const params = tokenId === undefined ? [this.project] : [this.project, tokenId];
+    return this.db
+      .prepare(`SELECT at, token_id AS tokenId, worker, action, outcome, detail FROM bus_ext_audit WHERE ${where} ORDER BY id DESC LIMIT ?`)
+      .all(...params, limit) as ExtAuditEntry[];
   }
 
   // ============ Reports ============
