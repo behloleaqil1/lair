@@ -16,7 +16,7 @@
  */
 import type { EventBus } from "../core/event-bus.js";
 import type { BusStore, BusReport, BusMessage } from "./store.js";
-import type { BusTokenBinding } from "./tokens.js";
+import type { BusTokenBinding, ExtTokenBinding } from "./tokens.js";
 import { redactBusTokens } from "./tokens.js";
 import type { ReportKind } from "../../bus/types.js";
 import { BusMirror, type BusMirrorConfig } from "./mirror.js";
@@ -178,13 +178,48 @@ export class BusService {
       };
     }
 
+    return { ok: true, data: await this.record(binding.project, binding.agent, binding.runId, kind, task, summary, gateId, pr, sha) };
+  }
+
+  /**
+   * An external worker's report (an owner-issued token, `lair bus token create`): no run, so no claim to check. Only
+   * the token's kinds; the agent is always the token's `ext:<worker>` and the run id `ext:<token id>`. Then the same
+   * path as a run's report: sanitised, stored, mirrored, emitted.
+   */
+  async reportExternal(
+    binding: ExtTokenBinding,
+    kind: ReportKind,
+    task: string,
+    summary: string,
+    gateId?: string,
+    pr?: number,
+    sha?: string,
+  ): Promise<BusResult<ReportResult>> {
+    if (!binding.kinds.includes(kind)) {
+      return { ok: false, error: { code: "forbidden", message: `This token reports ${binding.kinds.join(", ")} only, not ${kind}` } };
+    }
+    return { ok: true, data: await this.record(binding.project, binding.agent, `ext:${binding.id}`, kind, task, summary, gateId, pr, sha) };
+  }
+
+  /** Store a report, mirror it, emit `bus.report`, and touch the wake file on DONE or BLOCKED */
+  private async record(
+    project: string,
+    agent: string,
+    runId: string,
+    kind: ReportKind,
+    task: string,
+    summary: string,
+    gateId?: string,
+    pr?: number,
+    sha?: string,
+  ): Promise<ReportResult> {
     const now = Date.now();
     // No bus token in a summary: the board, the mirror files and the live channel show it to every reader
     const sanitizedSummary = redactBusTokens(sanitizeText(summary, MAX_SUMMARY_CHARS));
 
     const id = this.store.createReport(
-      binding.agent,
-      binding.runId,
+      agent,
+      runId,
       kind,
       task,
       sanitizedSummary,
@@ -197,7 +232,7 @@ export class BusService {
     // Mirror to text files
     const mirrored: string[] = [];
     if (this.mirror) {
-      const files = await this.mirror.mirrorReport(binding.agent, kind, task, sanitizedSummary, iso(now), gateId, pr, sha, id);
+      const files = await this.mirror.mirrorReport(agent, kind, task, sanitizedSummary, iso(now), gateId, pr, sha, id);
       mirrored.push(...files);
     }
 
@@ -205,7 +240,7 @@ export class BusService {
     if (this.events) {
       // The summary only as far as the dashboard shows it (src/server/bus/live.ts): the event bus keeps recent events
       const summary = sanitizedSummary.slice(0, BUS_SUMMARY_MAX);
-      this.events.emit("bus.report", { project: binding.project, id, agent: binding.agent, kind, task, gateId, pr, sha, summary });
+      this.events.emit("bus.report", { project, id, agent, kind, task, gateId, pr, sha, summary });
     }
 
     // Wake on DONE or BLOCKED
@@ -213,7 +248,7 @@ export class BusService {
       await this.mirror?.touchWake(this.wakeFile);
     }
 
-    return { ok: true, data: { id, mirrored } };
+    return { id, mirrored };
   }
 
   // ============ inbox ============

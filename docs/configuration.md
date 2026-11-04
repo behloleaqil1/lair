@@ -201,10 +201,60 @@ A run's bus token is revoked on every way the run ends (exit, crash, failover, t
 claim released), whatever `bus.consume` is by then, and at start Lair revokes the tokens of runs that ended while it
 was down. `lair bus report` is refused with 400, and nothing is stored or mirrored, when its `sha` isn't 7 to 64 hex
 digits or its `gate_id` isn't a plain name (letters, digits, `.`, `_` and `-`, starting with a letter or digit, no
-`..`). The mirror appends to `queue_file`, `inbox_file` and `mail_dir` without blocking the server, one line at a time
+`..`) or holds a bus token. The mirror appends to `queue_file`, `inbox_file` and `mail_dir` without blocking the server, one line at a time
 per file; an owner message to a recipient that isn't a plain name gets no mailbox file.
 
 Turn `observe` on first, compare on Home → Health, then switch to `on`.
+
+### External worker tokens
+
+A worker that Lair doesn't run (your own session with an AI tool, its subagents, a script) has no run token. Instead of
+appending lines to `queue_file` by hand, it can report over the bus with a token you make for it:
+
+```bash
+export LAIR_OWNER_SESSION=<an owner session>   # the dashboard's, from a browser signed in as the owner
+lair bus token create --project <p> --worker <id> [--ttl 24h] [--kinds PROGRESS,WAITING,DONE,BLOCKED]
+lair bus token list --project <p>
+lair bus token revoke <token id> --project <p>
+```
+
+`create` prints the token (`lairext_` and 43 characters) once, with its id; Lair keeps only its sha256, as for run
+tokens. The worker sets it as `LAIR_BUS_TOKEN` and reports with `lair bus report` (or `POST /api/bus/call` with
+`{"tool": "report", ...}`), with no project named: the token names it. The token:
+
+- **reports only.** Every other bus tool (whoami, inbox, ack, send, board) gets 403, and the routes of fill, decisions,
+  runs, reviews and merges, which take only the owner's session, refuse it as any request without one (403). The checks
+  routes and `lair bus-mcp` take only run tokens.
+- **reports as `ext:<worker>`**, whatever the request says: never a fleet agent's id, also when the worker id is one.
+  The worker id follows the agent id rules (a letter first, then letters, digits, `_` and `-`, at most 64). The report's
+  run id is `ext:<token id>`.
+- **takes the same report path as a run's** (the same checks, the summary cleaned and every bus token in it replaced by
+  `[bus-token]`, the same mirrored line ending `[bus:<id>]`, the same `bus.report` event), so Home, fill and the planner
+  see it. There is no claim to check: it may report on any task id (a letter or digit first, then letters, digits,
+  `.`, `/`, `#`, `:` and `-`; 400 otherwise). With fill's default patterns (no `{agent}`) a `DONE` it sends for a fill
+  task counts as a hand-written `DONE` line would, so give it only the kinds it needs. A fleet agent must not be named
+  `ext`: a pattern reads `by ext:<worker>` as written by `ext`.
+- **sends only its kinds** (default `PROGRESS`, `WAITING`, `DONE` and `BLOCKED`; `TICK` only when named): another kind
+  gets 403.
+- **expires** after `--ttl` (minutes, hours or days: `90m`, `24h`, `7d`; default 24 hours, at most 30 days), or when you
+  revoke it: then 401, and nothing is stored or mirrored.
+- **is limited** to 30 calls a minute (429 past that; refused calls don't count).
+
+Every call with a known token is audited with the token's id and worker (never the token): the outcome, and for a
+report its kind and bus id; making and revoking a token are audited with the owner session's public id. Lair keeps the
+latest 10000 entries per project.
+
+The CLI sends the owner session as the dashboard does (the `X-Lair-Owner-Session` header, `LAIR_URL`'s origin,
+same-origin), so it gets exactly what the dashboard gets. The API, all with an owner session and `?project=<name>`
+(404 while the project's `bus.consume` is `off`):
+
+- `POST /api/bus/tokens` `{worker, ttl_minutes?, kinds?}`: 201 `{token, info}`, the token shown this once
+- `GET /api/bus/tokens`: the project's tokens, newest first (revoked and expired ones too, at most 200): id, worker,
+  agent, kinds, created, expires, revoked, last used and report count
+- `POST /api/bus/tokens/<id>/revoke`: 404 when there is no such token not yet revoked
+- `GET /api/bus/tokens/audit[?token=<id>]`: the latest 200 audit entries, newest first
+
+The tokens have no Settings list yet; use `lair bus token list`.
 
 ## Dragons (agents)
 
@@ -804,7 +854,7 @@ Errors: 400 for invalid input, 403 for a cross-site request or an answer without
 
 ## Owner-only routes
 
-Every route that changes something only you should change needs the owner's session, the same one the Decision Inbox uses (see "Only you answer"): the `X-Lair-Owner-Session` header, from the dashboard's own origin, in a same-origin browser request. Without it the answer is HTTP 403, before the request's body is read, and nothing changes. `curl`, scripts, agents and other local programs can still read: every `GET` stays open, except the two that read prompt files from disk (`/api/agents/prompts`), AI spend (`/api/agents/spend`), which is cost and usage, the Settings API (`/api/settings`), whose reads reveal paths and commands, the AI tools API (`/api/ai`), whose reads run the tools' own commands, the cloud machines' status (`/api/cloud`), which names the account's instances and spend, Lair's diagnostics and the ops tokens and their audit (`/api/health/diagnostics`, `/api/supervisor`), and logs and test output (`/api/dashboard/.../output` and `.../log`, and the logs in pipeline runs), which can hold anything a test or an agent printed. No CORS is granted under these prefixes (`OWNER_ONLY_PREFIXES` in `src/server/human-auth/cors.ts`). The dashboard's views send the session once this browser is signed in, and show "sign in from Decisions" until it is.
+Every route that changes something only you should change needs the owner's session, the same one the Decision Inbox uses (see "Only you answer"): the `X-Lair-Owner-Session` header, from the dashboard's own origin, in a same-origin browser request. Without it the answer is HTTP 403, before the request's body is read, and nothing changes. `curl`, scripts, agents and other local programs can still read: every `GET` stays open, except the two that read prompt files from disk (`/api/agents/prompts`), AI spend (`/api/agents/spend`), which is cost and usage, the Settings API (`/api/settings`), whose reads reveal paths and commands, the AI tools API (`/api/ai`), whose reads run the tools' own commands, the cloud machines' status (`/api/cloud`), which names the account's instances and spend, Lair's diagnostics and the ops tokens and their audit (`/api/health/diagnostics`, `/api/supervisor`), the external worker tokens and their audit (`/api/bus/tokens`), and logs and test output (`/api/dashboard/.../output` and `.../log`, and the logs in pipeline runs), which can hold anything a test or an agent printed. No CORS is granted under these prefixes (`OWNER_ONLY_PREFIXES` in `src/server/human-auth/cors.ts`). The dashboard's views send the session once this browser is signed in, and show "sign in from Decisions" until it is.
 
 | Prefix | Owner only | Open |
 |--------|------------|------|
@@ -814,6 +864,7 @@ Every route that changes something only you should change needs the owner's sess
 | `/api/agents` | starting a run, releasing a claim, a fresh session, an early check, listing and reading prompt files, AI spend (`/api/agents/spend`, `/api/agents/spend/runs`) | status, runs, recoveries |
 | `/api/controls` | every `POST`: ask, instruct, tick, pause, resume, agent run/stop/release, gate submit/stuck, merge, dragon start/stop | status, inbox, audit, dragon config |
 | `/api/bus/send` | sending a message (it is sent as `owner`) | the board and the event stream (`/api/bus/board`, `/api/bus/events`) |
+| `/api/bus/tokens` | everything: making, listing and revoking [external worker tokens](#external-worker-tokens), their audit | nothing |
 | `/api/processes` | start, stop, restart | the list, a process, its logs |
 | `/api/settings` | everything: reading, checking and saving project settings, their history and restore, creating a project, the repository check, testing a machine | nothing |
 | `/api/scheduler`, `/api/tasks` | scheduler start, stop and tick; creating, cancelling and retrying tasks | status, tasks, jobs, nodes |

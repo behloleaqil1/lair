@@ -16,7 +16,7 @@ export type {
 } from "./service.js";
 
 export { BusStore, getBusStore, openedBusStore, existingBusStore, closeBusStores, messageState } from "./store.js";
-export type { BusReport, BusMessage, MessageState } from "./store.js";
+export type { BusReport, BusMessage, MessageState, ExtTokenView, ExtAuditEntry } from "./store.js";
 
 export {
   newBusToken,
@@ -25,8 +25,12 @@ export {
   redactBusToken,
   redactBusTokens,
   BUS_TOKEN_PREFIX,
+  newExtToken,
+  isExtTokenFormat,
+  EXT_TOKEN_PREFIX,
+  EXT_AGENT_PREFIX,
 } from "./tokens.js";
-export type { BusTokenBinding } from "./tokens.js";
+export type { BusTokenBinding, ExtTokenBinding } from "./tokens.js";
 
 export { BusMirror } from "./mirror.js";
 export type { BusMirrorConfig } from "./mirror.js";

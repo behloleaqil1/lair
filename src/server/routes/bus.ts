@@ -6,7 +6,10 @@
  * agents module mints and puts in LAIR_BUS_TOKEN.
  *
  * Routes:
- * - POST /api/bus/call: Agent API (requires bus token in Authorization header)
+ * - POST /api/bus/call: Agent API (requires bus token in Authorization header); an external worker's token
+ *   (`lairext_`) may only report
+ * - POST /api/bus/tokens {worker, ttl_minutes?, kinds?}: an external worker's token, shown once (owner session)
+ * - GET  /api/bus/tokens, GET /api/bus/tokens/audit?token=<id>, POST /api/bus/tokens/:id/revoke (owner session)
  * - GET  /api/bus/board: Board state for the UI (open)
  * - GET  /api/bus/events: SSE feed for the UI (open)
  * - POST /api/bus/send: Owner sends a message (requires owner session)
@@ -18,7 +21,7 @@
  * Claims have ONE source of truth: the agents module's claims. The bus does
  * not keep its own claim table.
  */
-import type { FastifyInstance } from "fastify";
+import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import { projectQueryGuard } from "./project-guard.js";
 import { rejectCrossSiteRequests } from "../origin.js";
 import type { HumanAuth } from "../human-auth/index.js";
@@ -30,8 +33,11 @@ import {
   getBusStore,
   hashBusToken,
   isBusTokenFormat,
+  isExtTokenFormat,
   messageState,
+  newExtToken,
   redactBusToken,
+  redactBusTokens,
   type BusConsumeMode,
   type BusConsumerHealth,
   type BusMirrorConfig,
@@ -46,8 +52,9 @@ import {
   BUS_SUMMARY_MAX,
   type BusActivity,
 } from "../../shared/bus-live.js";
-import type { AgentRun } from "../agents/types.js";
+import { isValidTaskId, type AgentRun } from "../agents/types.js";
 import { isPlainName } from "../agents/config.js";
+import { isValidDragonId } from "../parsers/dragon-config.js";
 import { z } from "zod";
 
 function respond<T>(data: T): ApiResponse<T> {
@@ -95,6 +102,7 @@ const toolSchemas = {
       .string()
       .max(200)
       .refine(isPlainName, "a plain name: letters, digits, '.', '_' and '-', starting with a letter or digit, no '..'")
+      .refine((value) => redactBusTokens(value) === value, "never a bus token")
       .optional(),
     pr: z.number().int().positive().optional(),
     sha: z.string().regex(SHA, "a commit id: 7 to 64 hex digits").optional(),
@@ -113,6 +121,31 @@ const toolSchemas = {
 } as const;
 
 type ToolName = keyof typeof toolSchemas;
+
+// ============ External worker tokens ============
+
+/** Calls a minute one external worker's token may make: more get 429 */
+export const EXT_CALLS_PER_MINUTE = 30;
+/** A token's life unless the owner names one (ttl_minutes), and the longest */
+const EXT_TTL_DEFAULT_MINUTES = 24 * 60;
+const EXT_TTL_MAX_MINUTES = 30 * 24 * 60;
+/** The kinds a token reports unless the owner names them */
+const EXT_DEFAULT_KINDS: readonly ReportKind[] = ["PROGRESS", "WAITING", "DONE", "BLOCKED"];
+const TOKEN_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+
+const CreateExtToken = z
+  .object({
+    worker: z.string().refine(isValidDragonId, "a worker id: a letter first, then letters, digits, '_' and '-' (at most 64)"),
+    ttl_minutes: z.number().int().min(1).max(EXT_TTL_MAX_MINUTES).optional(),
+    kinds: z.array(ReportKindSchema).min(1).max(5).optional(),
+  })
+  .strict();
+
+const firstIssues = (error: z.ZodError, root: string) =>
+  error.issues
+    .slice(0, 3)
+    .map((i) => `${i.path.join(".") || root}: ${i.message}`)
+    .join("; ");
 
 /** POST /api/bus/call: a tool call with the run's bus token; the project is the token's when not named */
 interface CallRoute {
@@ -261,11 +294,123 @@ async function busRoutes(
 
   fastify.get<{ Querystring: { project: string } }>("/api/bus/consumers", async (request) => respond(options.health(request.query.project)));
 
+  // ============ An external worker's call (lairext_ token): reports only ============
+
+  /** Per external token id, its calls in the last minute */
+  const extCalls = new Map<string, number[]>();
+
+  const externalCall = async (request: FastifyRequest<CallRoute>, reply: FastifyReply, token: string) => {
+    // No message carries a bus token, whatever the caller sent (a zod message can quote a value)
+    const refuse = (statusCode: number, message: string) => {
+      const err = respondError(redactBusTokens(message), statusCode);
+      return reply.code(err.statusCode).send(err);
+    };
+    const hash = hashBusToken(token);
+    const now = Date.now();
+    const project =
+      request.query.project ?? options.enabled().find((name) => busStoreFor(name, options.dataDir).validateExtToken(hash, now) !== null);
+    if (project === undefined || options.mode(project) === "off") return refuse(401, "Invalid, expired or revoked bus token");
+    const { service, store } = getBusService(project, options);
+    const binding = store.validateExtToken(hash, now);
+    if (!binding) return refuse(401, "Invalid, expired or revoked bus token");
+
+    // Audited by the token's id and worker, never the token; the tool by its name only when it is one
+    const { tool, args } = request.body ?? {};
+    const action = typeof tool === "string" && tool in toolSchemas ? tool : "(unknown tool)";
+    const audit = (outcome: "ok" | "refused", detail: string) =>
+      store.auditExt({ at: now, tokenId: binding.id, worker: binding.worker, action, outcome, detail: redactBusTokens(detail) });
+
+    // Calls past the limit are refused and not counted
+    const recent = (extCalls.get(binding.id) ?? []).filter((at) => now - at < 60_000);
+    if (recent.length >= EXT_CALLS_PER_MINUTE) {
+      extCalls.set(binding.id, recent);
+      audit("refused", `more than ${EXT_CALLS_PER_MINUTE} calls a minute`);
+      return refuse(429, `More than ${EXT_CALLS_PER_MINUTE} calls a minute with this token: slow down`);
+    }
+    extCalls.set(binding.id, [...recent, now]);
+
+    if (tool !== "report") {
+      audit("refused", "not a report");
+      return refuse(403, "An external worker's token only reports (tool: report)");
+    }
+    // The run path's checks, and a task id the consumers take (a run's is its claimed task, already one)
+    const parsed = toolSchemas.report.safeParse(args ?? {});
+    if (!parsed.success || !isValidTaskId(parsed.data.task)) {
+      const why = parsed.success ? "task: a task id (a letter or digit first, then letters, digits, '.', '/', '#', ':' and '-')" : firstIssues(parsed.error, "args");
+      audit("refused", why);
+      return refuse(400, why);
+    }
+    const report = parsed.data;
+    const result = await service.reportExternal(binding, report.kind, report.task, report.summary, report.gate_id, report.pr, report.sha);
+    if (!result.ok) {
+      audit("refused", result.error.message);
+      return refuse(403, result.error.message);
+    }
+    store.countExtReport(binding.id, now);
+    audit("ok", `${report.kind} [bus:${result.data.id}]`);
+    return respond(result.data);
+  };
+
+  // ============ External worker tokens (owner only) ============
+
+  const ownerOnly = auth.requireOwner("Only the owner can manage external worker tokens, from the dashboard signed in as the owner");
+  const ownerOf = (request: FastifyRequest) => `owner session ${auth.sessionOf(request)?.id ?? "(unknown)"}`;
+
+  // Shown once: only its hash is kept
+  fastify.post<{ Querystring: { project: string } }>("/api/bus/tokens", { onRequest: ownerOnly, bodyLimit: 4096 }, async (request, reply) => {
+    const body = CreateExtToken.safeParse(request.body ?? {});
+    if (!body.success) {
+      const err = respondError(firstIssues(body.error, "body"));
+      return reply.code(err.statusCode).send(err);
+    }
+    const store = busStoreFor(request.query.project, options.dataDir);
+    const now = Date.now();
+    const token = newExtToken();
+    const kinds = [...new Set<ReportKind>(body.data.kinds ?? EXT_DEFAULT_KINDS)];
+    const expiresAt = now + (body.data.ttl_minutes ?? EXT_TTL_DEFAULT_MINUTES) * 60_000;
+    const info = store.issueExtToken(body.data.worker, kinds, hashBusToken(token), now, expiresAt);
+    store.auditExt({ at: now, tokenId: info.id, worker: info.worker, action: "(token created)", outcome: "ok", detail: `by ${ownerOf(request)}; kinds ${kinds.join(",")}; expires ${info.expiresAt}` });
+    return reply.code(201).header("cache-control", "no-store").send(respond({ token, info }));
+  });
+
+  fastify.get<{ Querystring: { project: string } }>("/api/bus/tokens", { onRequest: ownerOnly }, async (request) =>
+    respond(busStoreFor(request.query.project, options.dataDir).listExtTokens()),
+  );
+
+  fastify.get<{ Querystring: { project: string; token?: string } }>("/api/bus/tokens/audit", { onRequest: ownerOnly }, async (request, reply) => {
+    const id = request.query.token;
+    if (id !== undefined && !TOKEN_ID.test(id)) {
+      const err = respondError("Invalid token id");
+      return reply.code(err.statusCode).send(err);
+    }
+    return respond(busStoreFor(request.query.project, options.dataDir).listExtAudit(200, id));
+  });
+
+  fastify.post<{ Params: { id: string }; Querystring: { project: string } }>(
+    "/api/bus/tokens/:id/revoke",
+    { onRequest: ownerOnly, bodyLimit: 1024 },
+    async (request, reply) => {
+      const id = request.params.id;
+      const store = busStoreFor(request.query.project, options.dataDir);
+      const now = Date.now();
+      const worker = TOKEN_ID.test(id) ? store.revokeExtToken(id, now) : null;
+      if (worker === null) {
+        const err = respondError("No token with this id that is not revoked yet", 404);
+        return reply.code(err.statusCode).send(err);
+      }
+      extCalls.delete(id);
+      store.auditExt({ at: now, tokenId: id, worker, action: "(token revoked)", outcome: "ok", detail: `by ${ownerOf(request)}` });
+      return respond({ revoked: id });
+    },
+  );
+
   // ============ POST /api/bus/call - Agent API ============
 
   fastify.post<CallRoute>("/api/bus/call", { config: { projectOptional: true } }, async (request, reply) => {
     // Extract and validate token
     const token = extractToken(request.headers.authorization);
+    // An external worker's token (lairext_, the owner's): reports only, through its own checks
+    if (token !== null && isExtTokenFormat(token)) return externalCall(request, reply, token);
     if (!token || !isBusTokenFormat(token)) {
       const err = respondError("Missing or invalid bus token", 401);
       return reply.code(err.statusCode).send(err);
