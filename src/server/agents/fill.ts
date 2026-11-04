@@ -35,14 +35,16 @@
  *   - waiting: its last run exited 0 on a WAITING line. With a (?<wake>...)
  *     capture and fill.wake.file (a plain name, inside wake.root) it starts
  *     again once that file appears (a gate's result, say), with no backoff
- *     and nothing counted. Without a capture, a word of the line that is a
- *     gate in the gate queue (or whose wake.file came after the run's chain
- *     started) is its wake; without wake.file, such a gate is waited on while
- *     it is in the gate queue, and came once it left it. A wait on a gate in
- *     the gate queue never counts (#347). A wait on nothing that came (no
- *     gate named, a refused one, or a file already there when the run ended)
- *     counts as a run without progress: it starts again after
- *     wake.fallback_seconds and the backoff, and toward the no_done hold;
+ *     and nothing counted. Without a capture (and no G3 event named), a
+ *     word of the line that is a gate in the gate queue queued since the
+ *     run's chain started (or whose wake.file came after it started) is its
+ *     wake; without wake.file, such a gate is waited on while it is in the
+ *     gate queue, and came once it left it. A wait on a gate in the gate
+ *     queue queued since the chain started never counts (#347). A wait on
+ *     nothing that came (no gate named, a refused one, or a file already
+ *     there when the run ended) counts as a run without progress: it starts
+ *     again after wake.fallback_seconds and the backoff, and toward the
+ *     no_done hold;
  *   - waited_too_long: its runs have been waiting, in a row, longer than
  *     wake.max_wait_minutes (counted from the store, across restarts),
  *     not counting the time the gate the latest one waits on was still in
@@ -157,7 +159,13 @@ interface CapacityState {
   heavy?: number;
 }
 const QUEUE_MAX_BYTES = 4 * 1024 * 1024;
-const QUEUE_LINE_CHARS = 1000;
+/**
+ * Each queue line is cut to this many characters before anything reads it.
+ * A mirrored bus report (bus/mirror.ts: task, agent, a summary of up to
+ * 2000 characters, then its [<gate id>], PR, [<sha>] and [bus:<id>]) is at
+ * most about 2,600, so its gate id and its marker are never cut off (#347).
+ */
+const QUEUE_LINE_CHARS = 4000;
 const MARK_TAIL_BYTES = 256;
 /** Checks in a row a held line must be gone from the tasks file before its decision is withdrawn */
 export const LINE_GONE_CHECKS = 3;
@@ -344,9 +352,13 @@ type WaitState =
 
 /** How many of a task's newest chains the no-done count and the wait streak look at */
 const MAX_CHAINS_LOOKED_AT = 50;
-/** A waiting line whose pattern captured no wake: at most this many of its words are looked at as gate ids */
-const MAX_LINE_WORDS = 64;
-/** ... and at most this many of them (bracketed ones first) are looked up on disk: re-queue markers and result files */
+/**
+ * A waiting line whose pattern captured no wake: of the words of the whole
+ * line (cut at QUEUE_LINE_CHARS) that are plain names, bracketed ones
+ * nearest the end first, at most this many that are in the gate queue have
+ * their request looked up on disk, and at most this many of the first of
+ * them their re-queue markers and result files
+ */
 const MAX_LINE_LOOKUPS = 8;
 /** What is cut from both ends of a word before it is looked at as a gate id ("[<id>]", "<id>,", "(<id>)") */
 const LINE_WORD_EDGES = /^[[(<{"'`]+|[\])>}"'`.,;:!?]+$/g;
@@ -1578,7 +1590,8 @@ export class AgentsFill {
    * progress: no done line, or a WAITING line on nothing that came (no wake,
    * a refused one, or a result already there when the run ended). A run
    * whose wake really came (fill_woken), or whose gate fill saw in the gate
-   * queue (fill_gate_queued: a live wait), neither counts nor ends the row; a
+   * queue, queued since its chain started (fill_gate_queued with own: a live
+   * wait), neither counts nor ends the row; a
    * blocked one ends it (only the owner's release starts it again). The row
    * starts after the owner's last release, and a chain the owner started is
    * its first (a new start counts afresh).
@@ -1590,9 +1603,8 @@ export class AgentsFill {
       if (head.chainId === releasedChain) break;
       const last = store.chainRuns(head.chainId).at(-1);
       if (!last || last.state !== "completed") break;
-      const kinds = new Set(
-        store.listEvents(project, { kinds: ["fill_blocked", "fill_woken", "fill_gate_queued"], task, runId: last.id, limit: 10 }).map((e) => e.kind),
-      );
+      const events = store.listEvents(project, { kinds: ["fill_blocked", "fill_woken", "fill_gate_queued"], task, runId: last.id, limit: 10 });
+      const kinds = new Set(events.filter((e) => e.kind !== "fill_gate_queued" || e.data.own !== false).map((e) => e.kind));
       if (kinds.has("fill_blocked")) break;
       if (!kinds.has("fill_woken") && !kinds.has("fill_gate_queued")) counted.push(last);
       if (head.origin !== "fill" || counted.length >= settings.maxCompletionsWithoutDone) break;
@@ -1997,22 +2009,26 @@ export class AgentsFill {
         // A line whose pattern captured no wake may still name the gate it waits on (#347)
         const lineGate = status.wake === null ? await this.gateInLine(latest, task, status, gateQueue) : null;
         const waitStatus = lineGate === null ? status : { ...status, wake: lineGate };
-        // The gate it waits on is still in the gate queue (under its id, or one it was re-queued as): a live wait
+        // The gate it waits on is still in the gate queue (under its id, or one it was re-queued as): a live wait for
+        // the wait budget. Captured or found in the line, it is the run's own only when queued since its chain started:
+        // only that one is never counted, never started on a timer, and waited on without wake.file (#347)
         const inQueue = await this.queuedGate(waitStatus.wake, gateQueue);
-        const wait = await this.classifyWait(latest, agent, task, waitStatus, now, inQueue);
+        const ownQueue = inQueue !== null && inQueue.since >= this.chainStart(latest) ? inQueue : null;
+        const wait = await this.classifyWait(latest, agent, task, waitStatus, now, ownQueue);
         const queued = wait.kind === "woken" ? null : inQueue;
+        const own = wait.kind === "woken" ? null : ownQueue;
         // G3 observe: the event the wait names came; recorded once, and nothing else changes
         if (wait.kind === "weak" && wait.event?.came) await this.wouldWake(latest, agent, task, wait.event, wait.event.came);
         // Waiting on nothing that came is a run without progress: N of them hold the task (and that hold stays).
-        // A wait on a gate in the gate queue is never one (#347)
-        const completions = wait.kind === "weak" && queued === null ? this.completionsWithoutDone(task, releasedChain) : [];
+        // A wait on its own gate in the gate queue is never one (#347)
+        const completions = wait.kind === "weak" && own === null ? this.completionsWithoutDone(task, releasedChain) : [];
         if (completions.length >= settings.maxCompletionsWithoutDone) {
           await holdNoDone(latest, completions);
           continue;
         }
         const pollKey = `${task}|${latest.id}`;
         this.waitingSeen.add(pollKey);
-        await this.noteQueued(latest, agent, task, pollKey, queued, now);
+        await this.noteQueued(latest, agent, task, pollKey, queued, own !== null, now);
         const queuedView = queued ? queuedGateView(queued) : null;
         // A wait budget across restarts: from the first run of this streak of waiting runs
         const streak = this.waitStreak(task, releasedChain);
@@ -2097,10 +2113,10 @@ export class AgentsFill {
           const detail = queued ? `waiting: ${queuedText(queued)}; starts again ${until}` : wait.detail;
           await hold("waiting", detail, latest.id, { ...wait.view, queued: queuedView }, status.busId);
           continue;
-        } else if (queued) {
-          // Its gate is in the gate queue (with a result older than the run, or a wake file fill may not read): a live
-          // wait, not counted and not started on a timer (#347)
-          await hold("waiting", `waiting: ${queuedText(queued)}; starts again once it leaves the gate queue`, latest.id, { ...wait.view, queued: queuedView }, status.busId);
+        } else if (own) {
+          // Its own gate is in the gate queue (with a result older than the run, or a wake file fill may not read): a
+          // live wait, not counted and not started on a timer (#347)
+          await hold("waiting", `waiting: ${queuedText(own)}; starts again once it leaves the gate queue`, latest.id, { ...wait.view, queued: queuedView }, status.busId);
           continue;
         } else {
           // Waiting on nothing that came: a run without progress, counted and backed off. G3 act: a wait that names
@@ -2115,7 +2131,7 @@ export class AgentsFill {
           if (now < at) {
             await hold(
               "waiting",
-              `${wait.detail}; ${counted ? `counted as a run without progress (${count} of ${settings.maxCompletionsWithoutDone})` : "not counted (its gate was in the gate queue)"}: starting it again at ${iso(at)}`,
+              `${wait.detail}${queued ? `; ${queuedText(queued)}` : ""}; ${counted ? `counted as a run without progress (${count} of ${settings.maxCompletionsWithoutDone})` : "not counted (its gate was in the gate queue)"}: starting it again at ${iso(at)}`,
               latest.id,
               { ...wait.view, fallbackAt: iso(at), queued: queuedView },
             );
@@ -2727,7 +2743,9 @@ export class AgentsFill {
    * fill_woken, fill_weak): a run once weak stays weak, so a result file
    * rewritten later can't lift a no_done hold; only the owner does.
    * A capture that isn't a plain name, or whose file would be outside
-   * wake.root, is refused, and shown.
+   * wake.root, is refused, and shown. `queued`: the wait's gate in the gate
+   * queue when it was queued since the run's chain started (its own), else
+   * null (#347).
    */
   private async classifyWait(
     latest: AgentRun,
@@ -2772,7 +2790,7 @@ export class AgentsFill {
       const pollKey = `${task}|${latest.id}`;
       if (seen.has("fill_weak")) {
         // Its gate was in the gate queue again after that (#347): a result written since fill saw it there is the re-run's
-        const queuedAt = queued === null ? store.listEvents(project, { kinds: ["fill_gate_queued"], task, runId: latest.id, limit: 1 })[0]?.at : undefined;
+        const queuedAt = queued === null ? this.ownQueuedEvent(task, latest.id)?.at : undefined;
         if (queuedAt === undefined) return stale;
         this.waitingSeen.add(pollKey);
         const again = await this.wakeFile(pollKey, file, now);
@@ -2823,7 +2841,7 @@ export class AgentsFill {
           until: "once it leaves the gate queue",
         };
       }
-      if (store.hasEvent(project, `fill_gate_queued:${task}:${latest.id}`)) {
+      if (this.ownQueuedEvent(task, latest.id)) {
         return { kind: "woken", named: shown, file: status.wake, came: `gate ${shown} left the gate queue` };
       }
     }
@@ -3056,38 +3074,43 @@ export class AgentsFill {
 
   /**
    * The gate a waiting line names when its pattern captured no wake (#347;
-   * a mirrored bus line puts it after "by <agent>"): the one fill saw in the
-   * gate queue for this run before (fill_gate_queued, so it holds once the
-   * gate left the queue and across restarts), else the first of the line's
-   * words (at most MAX_LINE_WORDS, a plain name once brackets and
-   * punctuation are cut, bracketed ones first) that is
+   * a mirrored bus line puts it after "by <agent>" and a summary of up to
+   * 2000 characters). None for a line that names an event G3 waits on (a
+   * PR, a decision, a bus message): it waits for that. Else the one fill saw
+   * in the gate queue for this run before, queued since its chain started
+   * (fill_gate_queued with own, so it holds once the gate left the queue
+   * and across restarts), else the first of the whole line's words that are
+   * plain names once brackets and punctuation are cut (bracketed ones
+   * nearest the end first, then the rest in order) that is
    * - a gate in the gate queue (under its id, or one wake.requeue_marker
    *   says it became) whose request was written since the run's chain
    *   started: the run queued it, not another task long before; or
-   * - with wake.file, and when the line names no G3 event to wait on: a gate
-   *   whose result (or a re-queued id's) came after the chain started.
-   * The disk is read for at most MAX_LINE_LOOKUPS words. null: it names
-   * nothing fill can wait on (a finished gate's id is no wait).
+   * - with wake.file: a gate whose result (or a re-queued id's) came after
+   *   the chain started.
+   * The disk is read for at most MAX_LINE_LOOKUPS of the words in the gate
+   * queue (their requests), and for at most MAX_LINE_LOOKUPS words
+   * (markers and result files). null: it names nothing fill can wait on (a
+   * finished gate's id is no wait).
    */
   private async gateInLine(run: AgentRun, task: string, status: RunStatus, gateQueue: () => Promise<Map<string, QueuedRequest>>): Promise<string | null> {
-    const { store, project, settings } = this.options;
-    const kept = store.listEvents(project, { kinds: ["fill_gate_queued"], task, runId: run.id, limit: 1 })[0];
+    const { settings } = this.options;
+    if (settings.wake.events.mode !== "off" && wakeTargetOf(status.captures).target !== null) return null;
+    const kept = this.ownQueuedEvent(task, run.id);
     if (kept) {
       const gate = typeof kept.data.requeuedFrom === "string" ? kept.data.requeuedFrom : kept.data.gate;
       if (typeof gate === "string" && isPlainWake(gate)) return gate;
     }
-    const raw = status.line.split(/\s+/, MAX_LINE_WORDS);
-    const plain = (words: string[]) => words.map((word) => word.replace(LINE_WORD_EDGES, "")).filter(isPlainWake);
-    const words = [...new Set([...plain(raw.filter((w) => w.startsWith("["))), ...plain(raw)])];
+    const raw = status.line.split(/\s+/);
+    const bracketed = raw.filter((word) => word.startsWith("[")).reverse();
+    const words = [...new Set([...bracketed, ...raw].map((word) => word.replace(LINE_WORD_EDGES, "")))].filter(isPlainWake);
     if (words.length === 0) return null;
     const start = this.chainStart(run);
     const queue = await gateQueue();
     const ownQueued = async (word: string) => ((await this.queuedGate(word, gateQueue))?.since ?? -Infinity) >= start;
-    for (const word of words) if (queue.has(word) && (await ownQueued(word))) return word;
+    for (const word of words.filter((w) => queue.has(w)).slice(0, MAX_LINE_LOOKUPS)) if (await ownQueued(word)) return word;
     const lookups = words.slice(0, MAX_LINE_LOOKUPS);
     if (settings.wake.requeueMarker) for (const word of lookups) if (!queue.has(word) && (await ownQueued(word))) return word;
-    // A result that came: not for a line that names an event to wait on (G3 waits for that instead)
-    if (!settings.wake.file || (settings.wake.events.mode !== "off" && wakeTargetOf(status.captures).target !== null)) return null;
+    if (!settings.wake.file) return null;
     for (const word of lookups) {
       const path = this.wakePath(word);
       if (!path.ok) continue;
@@ -3101,6 +3124,13 @@ export class AgentsFill {
     return null;
   }
 
+  /** The run's fill_gate_queued when its gate was queued since the run's chain started (own; an event from before own was kept has no own and counts as its own, as it did then): its own live wait (#347) */
+  private ownQueuedEvent(task: string, runId: string): ReturnType<AgentsStore["listEvents"]>[number] | undefined {
+    const { store, project } = this.options;
+    const event = store.listEvents(project, { kinds: ["fill_gate_queued"], task, runId, limit: 1 })[0];
+    return event && event.data.own !== false ? event : undefined;
+  }
+
   /**
    * Keep what fill saw of a waiting run's gate in the gate queue, for the
    * wait budget: fill_gate_queued when it first sees it there, and
@@ -3108,7 +3138,7 @@ export class AgentsFill {
    * gone (or the wake came). In between the last sighting is in memory; after
    * a restart, a gate seen queued before and gone now counts as seen until now.
    */
-  private async noteQueued(run: AgentRun, agent: string, task: string, key: string, queued: QueuedGate | null, now: number): Promise<void> {
+  private async noteQueued(run: AgentRun, agent: string, task: string, key: string, queued: QueuedGate | null, own: boolean, now: number): Promise<void> {
     const { store, project, probes } = this.options;
     const queuedKey = `fill_gate_queued:${task}:${run.id}`;
     if (queued) {
@@ -3122,7 +3152,8 @@ export class AgentsFill {
           runId: run.id,
           summary: `fill: ${agent} waits on ${task}'s gate ${queuedText(queued)}: the wait is alive`,
           evidence: [queued.path],
-          data: { gate: queued.gate, requeuedFrom: queued.requeuedFrom, lane: queued.lane, status: queued.status, path: queued.path },
+          // own: queued since the run's chain started, so the run's own live wait (#347)
+          data: { gate: queued.gate, requeuedFrom: queued.requeuedFrom, lane: queued.lane, status: queued.status, path: queued.path, own },
           dedupeKey: queuedKey,
         },
         probes.clock.now(),
