@@ -607,6 +607,29 @@ export class PlannerStore {
     return rows.map(toProposal);
   }
 
+  /**
+   * The oldest proposal still pending from another run with this op, task and agent (and text, when given): one
+   * bounded query (planner.guards.dedupe_pending), however many other proposals wait.
+   */
+  pendingTwin(project: string, p: { op: string; task: string; agent: string | null; text?: string | null }, exceptRun: string): StoredProposal | null {
+    const byText = p.text !== undefined;
+    const row = this.db
+      .prepare(
+        `SELECT * FROM planner_proposals WHERE project = ? AND status = 'pending' AND op = ? AND task = ? AND agent IS ? AND run_id != ?
+         ${byText ? "AND text IS ?" : ""} ORDER BY created_at, idx LIMIT 1`,
+      )
+      .get(project, p.op, p.task, p.agent, exceptRun, ...(byText ? [p.text ?? null] : [])) as ProposalRow | undefined;
+    return row ? toProposal(row) : null;
+  }
+
+  /** Proposals made at or after `since`, the oldest first (the readiness report; at most `limit`). */
+  proposalsSince(project: string, since: number, limit = 20_000): StoredProposal[] {
+    const rows = this.db
+      .prepare(`SELECT * FROM planner_proposals WHERE project = ? AND created_at >= ? ORDER BY created_at, idx LIMIT ?`)
+      .all(project, since, limit) as ProposalRow[];
+    return rows.map(toProposal);
+  }
+
   countPending(project: string): number {
     return (
       this.db.prepare(`SELECT COUNT(*) AS n FROM planner_proposals WHERE project = ? AND status = 'pending'`).get(project) as {
@@ -654,6 +677,14 @@ export class PlannerStore {
       .prepare(`${CHANGE_SELECT} WHERE c.project = ? ORDER BY c.at DESC, c.rowid DESC LIMIT ?`)
       .all(project, limit) as ChangeRow[];
     return rows.map(toChange);
+  }
+
+  /** Changes at or after `since`: the newest `limit` of them, the oldest first (the readiness report). */
+  changesSince(project: string, since: number, limit = 20_000): ChangeView[] {
+    const rows = this.db
+      .prepare(`${CHANGE_SELECT} WHERE c.project = ? AND c.at >= ? ORDER BY c.at DESC, c.rowid DESC LIMIT ?`)
+      .all(project, since, limit) as ChangeRow[];
+    return rows.reverse().map(toChange);
   }
 
   /** One change of the project, or null. */

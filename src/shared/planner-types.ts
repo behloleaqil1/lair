@@ -180,7 +180,8 @@ export interface RefusalView {
   op: string;
   task: string;
   at: string;
-  why: "undid" | "declined" | "removed";
+  /** reverted: an outside edit changed a line the planner reworded or reassigned back to what it was */
+  why: "undid" | "declined" | "removed" | "reverted";
   /** An add of the task waits for the owner (the hold) */
   held: boolean;
 }
@@ -252,4 +253,40 @@ export interface HandledMessageView {
 export interface OwnerMessageStateView {
   id: string;
   handled: HandledMessageView | null;
+}
+
+/** A part of the planner that has its own off/observe/act mode (docs/design/planner-act.md §4.4) */
+export type ReadinessPart = "planner.mode" | "backlog.mode" | "backlog.assign" | "spec_first.mode";
+/** switch_back: the part is in act, and a change it applied was undone or edited back within 24 hours */
+export type ReadinessVerdict = "ready" | "not_yet" | "switch_back";
+
+export interface ReadinessCriterionView {
+  id: string;
+  label: string;
+  ok: boolean;
+  /** The counts behind it */
+  detail: string;
+}
+
+export interface ReadinessRowView {
+  part: ReadinessPart;
+  /** The part's mode now */
+  mode: string;
+  verdict: ReadinessVerdict;
+  criteria: ReadinessCriterionView[];
+  /** The samples that failed: task ids (at most 50) */
+  failed: string[];
+  /** In act: the changes it applied that the owner undid or edited back within 24 hours (at most 50) */
+  undone: { change: string; op: string; task: string | null; at: string; how: "undone" | "edited back" }[];
+}
+
+/** GET /api/planner/readiness (owner only): the evidence to switch each part from observe to act. Read-only. */
+export interface PlannerReadinessView {
+  at: string;
+  /** The window's start: at minus days */
+  since: string;
+  days: number;
+  minSamples: number;
+  minAgreement: number;
+  rows: ReadinessRowView[];
 }

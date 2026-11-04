@@ -5,7 +5,7 @@
  * `confirm: true`; the server refuses them without it.
  */
 import { fetchApi, ownerHeaders } from "./owner-session";
-import type { ChangeView, PlannerOverviewView, PlannerRunView, ProposalView } from "../shared/planner-types";
+import type { ChangeView, PlannerOverviewView, PlannerReadinessView, PlannerRunView, ProposalView } from "../shared/planner-types";
 
 const withProject = (path: string, project: string) => `${path}?project=${encodeURIComponent(project)}`;
 
@@ -98,6 +98,11 @@ export function checkNowAction(project: string): { url: string; body: Record<str
 export interface VerifierAgreementStats {
   agreed: number;
   total: number;
+}
+
+/** The readiness report; rejects (409) while planner.act_evidence is off */
+export function getReadiness(project: string): Promise<PlannerReadinessView> {
+  return fetchApi<PlannerReadinessView>(withProject("/api/planner/readiness", project), { headers: ownerHeaders() });
 }
 
 export function getVerifierAgreement(project: string): Promise<VerifierAgreementStats> {

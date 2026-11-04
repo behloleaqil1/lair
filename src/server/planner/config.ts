@@ -249,6 +249,17 @@ const PlannerSchema = z
       })
       .strict()
       .default({}),
+    /** The readiness report (planner-act.md §4.4): the evidence to switch a part from observe to act */
+    act_evidence: z
+      .object({
+        /** Off: no mode history, no report, no warning (main's behaviour) */
+        enabled: z.boolean().default(false),
+        days: z.number().int().min(1).max(60).default(7),
+        min_samples: z.number().int().min(1).max(1000).default(20),
+        min_agreement: z.number().gt(0).max(1).default(0.9),
+      })
+      .strict()
+      .default({}),
   })
   .strict();
 
@@ -372,6 +383,8 @@ export interface PlannerSettings {
   refuseUndoneDays: number;
   /** The act-mode rules this config breaks, in warn mode (one notice per text; planner-act.md §4.3) */
   actRules: string[];
+  /** planner.act_evidence: the readiness report (planner-act.md §4.4) */
+  actEvidence: { enabled: boolean; days: number; minSamples: number; minAgreement: number };
   /** Not errors: the planner runs, but the owner should know */
   warnings: string[];
 }
@@ -709,6 +722,12 @@ export function parsePlannerConfig(raw: unknown, project: ProjectConfig, actRule
       },
       refuseUndoneDays: value.act.refuse_undone_days,
       actRules: actRules === "warn" ? broken : [],
+      actEvidence: {
+        enabled: value.act_evidence.enabled,
+        days: value.act_evidence.days,
+        minSamples: value.act_evidence.min_samples,
+        minAgreement: value.act_evidence.min_agreement,
+      },
       warnings,
     },
   };

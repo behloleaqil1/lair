@@ -381,6 +381,32 @@ Built from [planner-act.md](planner-act.md) §8, PR 1 (§4.3 there is the design
 - **Fail closed.** A hold stays while a plan source can't be read; the verifier's auto-apply checks the refusals and
   holds again, so a decline made while a run was verified still holds.
 
+## Readiness for act
+
+Built from [planner-act.md](planner-act.md) §8, PR 2 (§4.4 there is the design), behind `act_evidence.enabled` (off:
+no history, no report, no warning):
+
+- **Mode history.** Each cycle compares `mode` and the guard modes with the newest `mode_history` entry in
+  `planner_state` and appends one when they differ (the newest 200), so an entry marks each load or reload that changed
+  them. `parts` is empty until the backlog and spec parts (PRs 3-5) add their modes. `mode_history_seen` (written at
+  most every 10 minutes) dates the history; a load more than an hour after it appends an entry with `gapFrom`, and a
+  gap inside the window fails criterion (5): nobody knows what was set then. A report or history error is logged and
+  never stops the cycle.
+- **The report** (`readiness.ts`, pure; `GET /api/planner/readiness`, the Planner view's panel). It reads proposals and
+  changes from `planner.db`, the `planner_dedupe_pending` spend events, the history and the `would_*` records
+  (`planner_state` key `act_evidence`, the newest 2,000, written by the parts through `recordWould`). A proposal Lair
+  held for the owner is not a verifier sample. "Later added" and "the next assignment" are read from applied proposals
+  and from the `+` lines of outside edits; a would_add for a task the skip marker marks or that was done by then is a
+  failed sample.
+- **After the switch.** For a part in act since its newest act streak began, an applied proposal's change that the
+  owner undid, or whose written line an outside edit took out or changed, within 24 hours makes the row **switch back
+  recommended**. Marking the task done, or moving the line, is not an edit back. The report reads the newest 20,000
+  changes and indexes them once.
+- **Fail closed.** 50,000 or more guard events in the window: criterion (3) can't be judged and fails. An approve
+  that no longer applied (`rejected`, "no longer valid") is not counted as the owner's answer.
+- **Load warning.** At the first cycle after a load with `mode: act`, a **not yet** row is a status warning, a server
+  log line and one `planner.act_readiness` notice per act streak (C17).
+
 ## Not built
 
 Task cards with acceptance criteria and size budgets, a dependency graph across documents, stacked-branch rebases,

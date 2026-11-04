@@ -11,6 +11,7 @@ import type { ProjectConfig } from "../../shared/types.js";
 import { ReviewStore } from "../review/store.js";
 import { parsePlannerConfig } from "./config.js";
 import { PlannerStore } from "./store.js";
+import { randomUUID } from "crypto";
 import { REFUSAL_HOLD } from "./service.js";
 import {
   cleanup,
@@ -21,6 +22,7 @@ import {
   plannerBlock,
   projectConfig,
   promptOf,
+  claimTask,
   runPlannerAgent,
   setup,
   tasks,
@@ -304,6 +306,21 @@ describe("AT-14: the owner's Undo", () => {
     expect(tasksText(h)).toContain("worker-b|Bob|t4|Four");
   });
 
+  it("a task fill has claimed (a claim with no run in the planner's view yet) is refused with 409, and its line stays", async () => {
+    const { h } = await applied();
+    const before = tasksText(h);
+    claimTask(h, "t1", "worker-a");
+    const claimed = await undo(h, changeOf(h, "add", "t1").id);
+    expect(claimed.statusCode).toBe(409);
+    expect(claimed.json().error).toBe("task t1 is claimed by run 00000000 (agent worker-a): undo it once the claim ends");
+    expect(tasksText(h)).toBe(before);
+    expect(h.service.history().filter((x) => x.op === "undo")).toEqual([]);
+    expect(h.service.overview().refusals).toEqual([]);
+    // The claim ends: the undo goes through
+    h.agentsStore.releaseClaim("demo", "t1");
+    expect((await undo(h, changeOf(h, "add", "t1").id)).statusCode).toBe(200);
+  });
+
   it("a reword's undo puts the line before it back; a rules change (the queue's done line) is refused naming the queue line", async () => {
     const { p, h } = await applied();
     // An add whose task has a done line since: its line stays
@@ -460,9 +477,10 @@ describe("AT-18: the refusal window and the hold", () => {
     expect(h.service.overview().refusals).toEqual([]);
     writeFileSync(p.tasksFile, tasksText(h).replace("worker-a|Alice|t2|Two, better", "worker-a|Alice|t2|Two"));
     await h.service.cycle();
-    expect(h.service.overview().refusals).toEqual([expect.objectContaining({ op: "reword", task: "t2", why: "removed", held: false })]);
+    // Changed back, not removed: the line is still there (PR #357 review, low 2)
+    expect(h.service.overview().refusals).toEqual([expect.objectContaining({ op: "reword", task: "t2", why: "reverted", held: false })]);
     await planRun(h, [{ op: "reword", task: "t2", text: "Two, better", reason: "r" }]);
-    expect(proposalOf(h, "t2").refusal).toMatch(/^the owner removed reword t2 on /);
+    expect(proposalOf(h, "t2").refusal).toMatch(/^the owner changed back reword t2 on 2026-03-02: not proposed again for 7 days/);
   });
 });
 
@@ -526,4 +544,64 @@ describe("AT-17: these parts off are today's behaviour", () => {
     expect(h.agentsStore.listEvents("demo", { kinds: ["guard_would", "guard_did"], limit: 10 })).toEqual([]);
     expect(h.service.status().warnings.filter((w) => w.includes("planner.mode"))).toEqual([]);
   });
+});
+
+describe("PR #357 review lows", () => {
+  it("low 1: a config that no longer breaks the act rules clears the notice state, so breaking them again raises a new notice", async () => {
+    const p = makePaths();
+    tasks(p, ...BASE);
+    const broken = { ...SAFE, recheck_on_change: "observe" };
+    const h = await boot(p, { guards: broken });
+    const [first] = notices(h, "planner.act_rules");
+    expect(await h.answer(first.id, "noted")).toBe(200);
+    await h.planner.stop();
+    // Fixed: no notice
+    const fixed = await boot(p, { guards: SAFE }, { dbs: h.dbs, clock: h.clock });
+    expect(notices(fixed, "planner.act_rules").map((d) => d.id)).toEqual([first.id]);
+    await fixed.planner.stop();
+    // Broken again with the same text: a new notice
+    const again = await boot(p, { guards: broken }, { dbs: h.dbs, clock: h.clock });
+    const all = notices(again, "planner.act_rules");
+    expect(all).toHaveLength(2);
+    expect(all.filter((d) => d.id !== first.id)).toEqual([expect.objectContaining({ attention: "notice", class: "planner.act_rules" })]);
+  });
+
+  it("low 3: with refuse_undone_days 0 the overview lists no refusal, although records from before stay stored", async () => {
+    const p = makePaths();
+    tasks(p, ...BASE, "worker-a|Alice|t1|One");
+    const h = await boot(p, { guards: SAFE });
+    writeFileSync(p.tasksFile, tasksText(h).replace("worker-a|Alice|t1|One\n", ""));
+    await h.service.cycle();
+    expect(h.service.overview().refusals).toEqual([expect.objectContaining({ task: "t1", why: "removed", held: true })]);
+    await h.planner.stop();
+    const off = await boot(p, { guards: SAFE, act: { refuse_undone_days: 0 } }, { dbs: h.dbs, clock: h.clock });
+    expect(off.service.overview().refusals).toEqual([]);
+    // Nothing holds t1 either: its add applies
+    await planRun(off, [add("t1", "worker-a", "One")]);
+    expect(proposalOf(off, "t1").status).toBe("applied");
+  });
+
+  it("low 4: dedupe_pending finds the pending twin however many newer proposals wait (an exact query, not the newest 5,000)", async () => {
+    const p = makePaths();
+    tasks(p, ...BASE);
+    const h = await boot(p, { mode: "observe", guards: { dedupe_pending: "act" } });
+    await planRun(h, [add("t1", "worker-a", "One")]);
+    const first = proposalOf(h, "t1");
+    // 5,000 newer pending proposals of another run
+    const store = new PlannerStore(h.dbs.planner);
+    stores.push(store);
+    const filler = randomUUID();
+    for (let i = 0; i < 5000; i++) {
+      store.insertProposal({
+        project: "demo", runId: filler, index: i, op: "add", task: `f${i}`, agent: "worker-b", text: "Filler", reason: "r",
+        status: "pending", refusal: null, decidedBy: null, decidedAt: null, createdAt: h.clock.now() + 1 + i,
+        verifierVerdict: null, verifierReason: null, verifierEvidence: null,
+      });
+    }
+    h.clock.t += 10 * MIN;
+    await planRun(h, [add("t1", "worker-a", "One")]);
+    const dup = h.service.proposals({ limit: 500 }).find((x) => x.task === "t1" && x.runId !== first.runId);
+    expect(dup).toMatchObject({ status: "rejected" });
+    expect(dup?.refusal).toBe(`already pending as proposal ${first.id.slice(0, 8)} of run ${first.runId.slice(0, 8)} (planner.guards.dedupe_pending)`);
+  }, 60_000);
 });

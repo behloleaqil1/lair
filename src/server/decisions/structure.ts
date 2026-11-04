@@ -27,7 +27,7 @@ export interface KnownDecisionClass {
 }
 
 /**
- * The classes of the policy table (C1-C16) with the evidence codes each
+ * The classes of the policy table (C1-C17) with the evidence codes each
  * allows. A class outside this table is allowed but flagged; a known class
  * takes only its own codes.
  */
@@ -48,6 +48,8 @@ export const KNOWN_DECISION_CLASSES: Readonly<Record<string, KnownDecisionClass>
   "planner.guard_notice": { policy: "C15", codes: ["would_skip", "would_apply", "tasks_file_kept"] },
   // planner.mode: act without the guards act mode needs, in warn mode (docs/design/planner-act.md §4.3, D1)
   "planner.act_rules": { policy: "C16", codes: ["act_rules_missing"] },
+  // planner.mode: act while the readiness report says not yet (docs/design/planner-act.md §4.4)
+  "planner.act_readiness": { policy: "C17", codes: ["act_not_ready"] },
   "triage.gate_failure": {
     policy: "C8",
     codes: ["infra_download", "docker_down", "test_assertion", "unknown_failure", "infra_other", "same_failure_again"],
