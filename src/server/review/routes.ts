@@ -15,6 +15,7 @@
  *   POST /api/review/holds/:id/release          owner: {by}
  *   POST /api/review/gate-results               a signed gate result: refused (403) unless node_keys verify it; the first per id stays
  *   GET  /api/review/merges
+ *   GET  /api/review/merge-observations         external_gate: what the sweep would merge, per PR at its latest head
  *
  * "owner" routes need the owner's browser session (src/server/human-auth/),
  * checked before the body is read; /api/review is in OWNER_ONLY_PREFIXES, so
@@ -364,6 +365,10 @@ export async function registerReviewRoutes(
 
     app.get("/api/review/merges", async (request, reply) =>
       withService(request.query, reply, async (service) => service.listMerges()),
+    );
+
+    app.get("/api/review/merge-observations", async (request, reply) =>
+      withService(request.query, reply, async (service) => service.listMergeObservations()),
     );
   });
 }

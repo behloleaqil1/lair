@@ -46,7 +46,7 @@ import { newestChecks } from "../repos/checks.js";
 import { systemGit, type GitRunner } from "./git.js";
 import { LocalMerger, mergeOnHost, planMerge, type MergeExecution } from "./executor.js";
 import { ReviewStore, type AssignmentRecord, type AutoMergeState, type MergeObservation, type StoredReview } from "./store.js";
-import { gateRulesCondition } from "./gate-rules.js";
+import { gateRulesCondition, LISTED_FILES_CAP } from "./gate-rules.js";
 import { checkEnvironment, runPreMergeCheck, systemCheckRunner, type CheckRunner } from "./check.js";
 import { hostChecksGate, signedGate, type GateSource } from "./gate-source.js";
 import { verifySignedGateResult } from "../gates/signature.js";
@@ -781,6 +781,8 @@ export class ReviewService {
     const rules = gateRulesCondition(
       ext.gateRules,
       input.files.map((f) => ({ path: f.path, patch: f.patch })),
+      // The host lists at most LISTED_FILES_CAP files: a list that long may be cut short, so every rule applies
+      input.files.length >= LISTED_FILES_CAP,
       this.o.store.gateResults(this.project, input.headSha),
       input.headSha,
       g.source === "signed"
@@ -1390,7 +1392,7 @@ export class ReviewService {
           project: this.project,
           question: `Automatic merge of PR #${attempt.pr} at ${short(attempt.headSha)} was interrupted`,
           context: [
-            `An automatic merge (review.merge.auto) of PR #${attempt.pr} at ${attempt.headSha} started, and Lair stopped before it ended.`,
+            `An automatic merge (review.merge.auto or external_gate act) of PR #${attempt.pr} at ${attempt.headSha} started, and Lair stopped before it ended.`,
             "",
             "It may or may not have landed. Lair does not run it again at this head: check the target branch's history,",
             "and merge the PR from its page in PRs if it is still open.",
@@ -1442,7 +1444,7 @@ export class ReviewService {
         context: [
           `**${asContextText(status.title, 200)}**`,
           "",
-          `The policy allowed PR #${n} at ${status.headSha}, and the automatic merge (review.merge.auto) was refused:`,
+          `The policy allowed PR #${n} at ${status.headSha}, and the automatic merge (review.merge.auto or external_gate act) was refused:`,
           "",
           "```text",
           asContextText(reasons.join("\n"), 2000),
@@ -2077,7 +2079,7 @@ export class ReviewManager {
     }
     const every = this.options.agentCheckMs ?? CHECK_INTERVAL_MS;
     if (this.agentAssigner && every > 0) this.agentAssigner.start(every);
-    if (this.agentAssigner || [...this.services.values()].some((s) => s.settings.merge.auto)) this.startScanning();
+    if (this.agentAssigner || [...this.services.values()].some(sweeps)) this.startScanning();
   }
 
   get(project: string): ReviewService | undefined {

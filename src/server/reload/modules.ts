@@ -112,6 +112,8 @@ export function serverModules(m: ServerModules): ReloadableModule[] {
     modules.push({
       name: "review",
       blocks: ["review"],
+      // review.merge.external_gate reads pr_health.repos.<repo>.ci_signal
+      reads: ["pr_health"],
       validate: (config) => errorsOf(parseReviewConfig(config.review, config)),
       reload: (entry) => reviews.reloadProject(entry),
     });

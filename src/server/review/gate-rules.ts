@@ -19,6 +19,9 @@ export interface RuleFile {
   patch: string | null;
 }
 
+/** The most files the host lists for a PR (30 pages of 100); a list this long may be cut short */
+export const LISTED_FILES_CAP = 3000;
+
 export interface GateTrust {
   project: string;
   nodeKeys: Record<string, string>;
@@ -88,16 +91,27 @@ export function countingPasses(results: SignedGateResult[], head: string, trust:
     .filter(
       (p) =>
         !trusted.some(
-          (f) => f.status === "failed" && f.result.pipelineId === p.result.pipelineId && completedAt(f.result) > completedAt(p.result),
+          // A failure at the same time as the pass counts as newer: the tie fails closed
+          (f) => f.status === "failed" && f.result.pipelineId === p.result.pipelineId && completedAt(f.result) >= completedAt(p.result),
         ),
     )
     .map((p) => p.result);
 }
 
+/**
+ * Whether a report file is the named one: its name without the folder and a
+ * `.xml` ending is the name, or ends with `.<name>` or `-<name>` (JUnit's
+ * `TEST-<package>.<class>.xml`). Only that the gate wrote it is checked.
+ */
+export function reportIs(file: string, name: string): boolean {
+  const base = file.slice(file.lastIndexOf("/") + 1).replace(/\.xml$/i, "");
+  return base === name || base.endsWith(`.${name}`) || base.endsWith(`-${name}`);
+}
+
 function meets(need: GateRule["needsAny"][number], result: GateResult): boolean {
   if (need.pipelines && !need.pipelines.includes(result.pipelineId)) return false;
-  const names = (result.reports ?? []).map((r) => r.name);
-  return !need.reports || need.reports.every((s) => names.some((n) => n.includes(s)));
+  const files = (result.reports ?? []).map((r) => r.name);
+  return !need.reports || need.reports.every((name) => files.some((f) => reportIs(f, name)));
 }
 
 function describeNeeds(rule: GateRule): string {
@@ -114,12 +128,14 @@ function describeNeeds(rule: GateRule): string {
 export function gateRulesCondition(
   rules: GateRule[],
   files: RuleFile[],
+  /** The file list may be incomplete: every rule applies (fail closed) */
+  truncated: boolean,
   results: SignedGateResult[],
   head: string,
   trust: GateTrust,
 ): MergeCondition {
   const label = "Gate rules";
-  const applying = rules.filter((r) => ruleApplies(r, files));
+  const applying = truncated ? rules : rules.filter((r) => ruleApplies(r, files));
   if (applying.length === 0) return { id: "gate_rules", ok: true, label, detail: "no rule applies" };
   const passes = countingPasses(results, head, trust);
   const met: string[] = [];

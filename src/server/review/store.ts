@@ -1268,16 +1268,20 @@ export class ReviewStore {
              would_merge = excluded.would_merge, reasons = excluded.reasons, observed_at = excluded.observed_at`,
         )
         .run(project, pr, headSha, wouldMerge ? 1 : 0, kept, at);
+      // One row per PR (its latest observed head), so the table stays as small as the open PRs
+      this.db
+        .prepare(`DELETE FROM review_merge_observations WHERE project = ? AND pr = ? AND head_sha <> ?`)
+        .run(project, pr, headSha);
       return !before || before.would_merge !== (wouldMerge ? 1 : 0) || before.reasons !== kept;
     })();
   }
 
-  /** The newest observations, by PR number then time (at most `limit`). */
+  /** The most recent observations first (one per PR, at its latest observed head), at most `limit`. */
   mergeObservations(project: string, limit = 200): MergeObservation[] {
     const rows = this.db
       .prepare(
         `SELECT pr, head_sha, would_merge, reasons, observed_at FROM review_merge_observations
-         WHERE project = ? ORDER BY pr, observed_at LIMIT ?`,
+         WHERE project = ? ORDER BY observed_at DESC, pr DESC LIMIT ?`,
       )
       .all(project, limit) as { pr: number; head_sha: string; would_merge: number; reasons: string; observed_at: string }[];
     return rows.map((r) => ({
@@ -1303,6 +1307,9 @@ export class ReviewStore {
  * tried again at this head), `skipped` (the head moved or the policy changed
  * as it started: it may be tried again), `interrupted` (a restart stopped it).
  */
+export type AutoMergeState = "started" | "merged" | "failed" | "skipped" | "interrupted";
+
+/** review.merge.external_gate's verdict for a PR at its latest observed head */
 export interface MergeObservation {
   pr: number;
   headSha: string;
@@ -1310,8 +1317,6 @@ export interface MergeObservation {
   reasons: string[];
   observedAt: string;
 }
-
-export type AutoMergeState = "started" | "merged" | "failed" | "skipped" | "interrupted";
 
 export interface AutoMergeRecord {
   project: string;

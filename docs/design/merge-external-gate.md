@@ -47,7 +47,7 @@ review:
     auto: false                            # act replaces merge.auto (both on is a config error)
     external_gate:
       mode: observe                        # off (default) | observe | act
-      tiers: [amber, green]                # optional; default every tier
+      tiers: [amber, green]                # optional; default merge.auto_tiers, else every tier
       gate_rules:
         - id: routes
           paths: ["server/src/main/**/*.java"]
@@ -66,17 +66,22 @@ review:
 
 ## Rules
 
-**R1, merge signal.** When the review repository is listed with `pr_health.repos.<repo>.ci_signal: false`, the signal is
-the signed gate at the exact head, and the default-branch hold does not apply: a red default branch neither holds a PR nor
-asks for the red tier's reviews. With `ci_signal` true (or unlisted), `hold_when_default_red` keeps its meaning.
+**R1, merge signal.** In act, when the review repository is listed with `pr_health.repos.<repo>.ci_signal: false`, the
+signal is the signed gate at the exact head, and the default-branch hold does not apply: a red default branch neither holds
+a PR nor asks for the red tier's reviews. This drops the hold for any failed required result at the tip, a real break
+included; the owner's tool for a broken default branch is a project-wide hold (`POST /api/review/holds` without `pr`).
+In observe the hold stays for every merge and the verdict shows the act view. With `ci_signal` true (or unlisted),
+`hold_when_default_red` keeps its meaning. A change to `pr_health` reloads the review module.
 `external_gate` with `gate.source: checks` is a config error (host checks are what such a project doesn't trust).
 
 **R2, gate rules.** A rule applies to a PR when one of its changed files matches `paths` and, with
 `added_line_contains`, one of that file's added lines contains one of the strings. A file whose patch the host omits
-(too large) counts as matching: an unknown diff fails closed. An applying rule is met when **any** signed result at the
+(too large) counts as matching, and a file list as long as the host's cap (3000) makes every rule apply: an unknown
+diff fails closed. An applying rule is met when **any** signed result at the
 head is a trusted pass (known node, valid signature, this project, the configured pipeline version) that satisfies one
-`needs_any` option: its pipeline is in `pipelines` (when given) and each `reports` string is part of one of its signed
-report names (when given). A pass whose pipeline has a newer trusted failure at the head doesn't count. An unmet rule is
+`needs_any` option: its pipeline is in `pipelines` (when given) and each `reports` name is one of its signed report files
+(the base name without `.xml` is the name or ends with `.<name>` or `-<name>`; presence only). A pass whose pipeline has
+a trusted failure at the head finished at the same time or later doesn't count. An unmet rule is
 the policy condition `gate_rules` ("Gate rules: routes needs a passed gate at <head> with pipeline backend-full, or
 reports AccessControlTest").
 
@@ -92,10 +97,12 @@ at its head is not observed again either.
 
 ## Observation records
 
-`review_merge_observations` (review store schema 6), one row per project, PR and head: `would_merge`, `reasons` (at most
-20), `observed_at`. A sweep rewrites the row; the event `review.merge_observed` is emitted only when the verdict or the
-reasons changed, so a quiet project emits nothing per scan. `GET /api/review/prs/:n` shows the same verdict, computed
-fresh, as `externalGate: {mode, wouldMerge, reasons, defaultRedExempt}`.
+`review_merge_observations` (review store schema 6), one row per project and PR, at its latest observed head (a new
+head replaces the row): `would_merge`, `reasons` (at most 20), `observed_at`. The event `review.merge_observed` is
+emitted only when the verdict or the reasons changed, so a quiet project emits nothing per scan.
+`GET /api/review/merge-observations` lists the rows, most recent first; `GET /api/review/prs/:n` shows the same verdict,
+computed fresh, as `externalGate: {mode, wouldMerge, reasons, defaultRedExempt}`. The scan timer starts for a project
+with external_gate on even without `merge.auto` or reviews by agents.
 
 ## Failure modes
 
@@ -119,6 +126,9 @@ All in `src/server/review/external-gate.test.ts`, through `ReviewManager` with t
 | AT-5 | `externalGate_refused_head_not_retried` | act: a check_cmd refusal at a head is not tried again on the next scan; a new head is |
 | AT-6 | `externalGate_hold_list` | a held PR is recorded "would not merge" with the hold reason and not merged; released, it merges |
 | AT-7 | `externalGate_observe_writes_nothing` | observe: no merge, no check run, no decision; the event fires once per changed verdict |
+| AT-2c | `externalGate_gate_rule_reports`, `_tie`, `_truncated`, `_scope` | a longer report name doesn't count; a same-time failure unmeets; a capped file list applies every rule; non-matching files or lines apply none |
+| AT-4b | `externalGate_scan_starts_itself` | observe alone starts the periodic scan |
+| AT-6b | `externalGate_act_tiers`, `externalGate_observe_tiers` | act merges only listed tiers; observe records the tier reason |
 | AT-8 | `externalGate_config` | off by default; checks source, act with `merge.auto`, an empty `needs_any` option, an unknown pipeline are config errors |
 
 ## PR split

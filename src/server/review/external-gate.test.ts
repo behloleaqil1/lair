@@ -149,7 +149,7 @@ interface Rig extends Repo {
 function boot(
   at: Repo,
   externalGate: Record<string, unknown> | null,
-  options: { merge?: Record<string, unknown>; ciSignal?: boolean | null } = {},
+  options: { merge?: Record<string, unknown>; ciSignal?: boolean | null; autoRequestMs?: number } = {},
 ): Rig {
   const clock = new FakeClock(NOW);
   const spawner = new FakeSpawner();
@@ -166,7 +166,7 @@ function boot(
     fetch: fakeGitHubApi(at.remote),
     env: {},
     cwd: dir!,
-    autoRequestMs: 0,
+    autoRequestMs: options.autoRequestMs ?? 0,
     checks: spawner,
     events,
     decisions: {
@@ -269,6 +269,38 @@ describe("review.merge.external_gate", () => {
     expect(rig.remote.branches.get("main")).toBe(rig.head);
   });
 
+  it("externalGate_scan_starts_itself: observe alone (no merge.auto, no reviews by agents) starts the server's periodic scan", async () => {
+    const rig = boot(repo(), { mode: "observe" }, { autoRequestMs: 20 });
+    rig.service.addGateResult(signed(rig.head, "docs"));
+    for (let i = 0; i < 200 && rig.service.listMergeObservations().length === 0; i++) await new Promise((r) => setTimeout(r, 10));
+    expect(rig.service.listMergeObservations()).toEqual([expect.objectContaining({ pr: 3, wouldMerge: true })]);
+  });
+
+  it("externalGate_gate_rule_reports: a report counts by its exact name (JUnit TEST-<package>.<class>.xml), not a longer one", async () => {
+    const rig = boot(repo([ROUTE]), { mode: "act", gate_rules: [ROUTE_RULE] });
+    rig.service.addGateResult(signed(rig.head, "scoped", "passed", { reports: ["TEST-com.example.AccessControlTestSupport.xml"] }));
+    expect(condition(await rig.service.status(3), "gate_rules")).toMatchObject({ ok: false });
+    rig.service.addGateResult(signed(rig.head, "docs", "passed", { minutes: 5, reports: ["reports/AccessControlTest.xml"] }));
+    expect(condition(await rig.service.status(3), "gate_rules")).toMatchObject({ ok: true });
+  });
+
+  it("externalGate_gate_rule_tie: a failure of the pipeline finished at the same time as its pass unmeets the rule", async () => {
+    const rig = boot(repo([ROUTE]), { mode: "act", gate_rules: [ROUTE_RULE] });
+    rig.service.addGateResult(signed(rig.head, "scoped", "passed", { minutes: 0, reports: ["TEST-AccessControlTest.xml"] }));
+    rig.service.addGateResult(signed(rig.head, "scoped", "failed", { minutes: 0 }));
+    rig.service.addGateResult(signed(rig.head, "docs", "passed", { minutes: 1 }));
+    expect(condition(await rig.service.status(3), "gate_rules")).toMatchObject({ ok: false });
+  });
+
+  it("externalGate_gate_rule_truncated: a file list as long as the host's cap may be cut short, so every rule applies", async () => {
+    const many: FakeFile[] = Array.from({ length: 3000 }, (_, i) => ({ ...README, filename: `docs/page-${i}.md` }));
+    const rig = boot(repo(many), { mode: "act", gate_rules: [ROUTE_RULE] });
+    rig.service.addGateResult(signed(rig.head, "docs"));
+    const status = await rig.service.status(3);
+    expect(condition(status, "gate_rules")).toMatchObject({ ok: false });
+    expect(status.canMerge).toBe(false);
+  });
+
   it("externalGate_gate_rule_scope: a rule doesn't apply to a PR whose files or added lines don't match", async () => {
     const docs = boot(repo([README]), { mode: "act", gate_rules: [ROUTE_RULE] });
     docs.service.addGateResult(signed(docs.head, "scoped"));
@@ -324,7 +356,7 @@ describe("review.merge.external_gate", () => {
     rig.service.addGateResult(signed(second, "scoped"));
 
     await rig.scan();
-    const rows = rig.service.listMergeObservations();
+    const rows = rig.service.listMergeObservations().sort((a, b) => a.pr - b.pr);
     expect(rows.map((r) => [r.pr, r.wouldMerge])).toEqual([
       [3, true],
       [4, false],
@@ -435,6 +467,13 @@ describe("review.merge.external_gate", () => {
       parseReviewConfig({ enabled: true, merge: { gate: GATE, ...merge }, ...review }, { github: REPO });
     const plain = parse({});
     expect(plain.ok && plain.settings.merge.externalGate).toMatchObject({ mode: "off", tiers: null, gateRules: [] });
+    // Moving from merge.auto to act keeps auto_tiers unless tiers is given
+    const moved = parse({ auto_tiers: ["amber", "green"], external_gate: { mode: "act" } });
+    expect(moved.ok && moved.settings.merge.externalGate.tiers).toEqual(["amber", "green"]);
+    const own = parse({ auto_tiers: ["amber", "green"], external_gate: { mode: "act", tiers: ["green"] } });
+    expect(own.ok && own.settings.merge.externalGate.tiers).toEqual(["green"]);
+    // Off changes nothing, so it can't invalidate the block: its rules are checked once it is on
+    expect(parse({ gate: { source: "checks", required: ["build"] }, external_gate: { gate_rules: [ROUTE_RULE] } }).ok).toBe(true);
 
     const errors = (merge: Record<string, unknown>) => {
       const r = parse(merge);

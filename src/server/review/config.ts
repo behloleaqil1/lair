@@ -699,7 +699,8 @@ export function parseReviewConfig(
         autoMinIntervalSeconds: merge?.auto_min_interval_seconds ?? 120,
         externalGate: {
           mode: merge?.external_gate.mode ?? "off",
-          tiers: merge?.external_gate.tiers ?? null,
+          // Not given: the tiers merge.auto had (moving from auto to act keeps them), else every tier
+          tiers: merge?.external_gate.tiers ?? merge?.auto_tiers ?? null,
           gateRules: (merge?.external_gate.gate_rules ?? []).map((r) => ({
             id: r.id,
             paths: r.paths,
@@ -717,7 +718,8 @@ export function parseReviewConfig(
 function externalGateErrors(merge: z.infer<typeof MergeSchema>): string[] {
   const ext = merge.external_gate;
   const errors: string[] = [];
-  if (ext.mode === "off" && ext.gate_rules.length === 0) return errors;
+  // Off changes nothing, so it can't invalidate the review block either
+  if (ext.mode === "off") return errors;
   const at = "review.merge.external_gate";
   if (merge.gate.source !== "signed") {
     errors.push(`${at}: needs merge.gate.source: signed (the signed gate at the head is the merge signal)`);

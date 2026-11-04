@@ -501,4 +501,12 @@ describe("fingerprint", () => {
     expect(fp(agents, { ...base, watchdog: { enabled: false } }, all)).not.toBe(fp(agents, base, all));
     expect(fp(watchdogModule, { ...base, agents: { enabled: true } }, all)).toBe(fp(watchdogModule, base, all));
   });
+
+  it("reloads reviews when pr_health changes (review.merge.external_gate reads its ci_signal)", () => {
+    const [review] = serverModules({ reviews: {} as never });
+    expect(review.name).toBe("review");
+    const all = new Set(["review", "pr_health"]);
+    const withSignal = { ...base, pr_health: { repos: { "example/app": { ci_signal: false } } } };
+    expect(fp(review, withSignal, all)).not.toBe(fp(review, base, all));
+  });
 });

@@ -231,6 +231,13 @@ describe("review.db: schema 5 to 6", () => {
         { pr: 7, headSha: HEAD, wouldMerge: true, reasons: [], observedAt: "2026-03-02T09:10:00.000Z" },
       ]);
       expect(store.mergeObservations("other")).toEqual([]);
+      // A new head replaces the PR's row: one row per PR; the most recent first
+      store.observeMerge("demo", 8, HEAD, true, [], "2026-03-02T09:20:00.000Z");
+      expect(store.observeMerge("demo", 7, "b".repeat(40), false, ["Gate at head: missing"], "2026-03-02T09:30:00.000Z")).toBe(true);
+      expect(store.mergeObservations("demo").map((o) => [o.pr, o.headSha.slice(0, 1)])).toEqual([
+        [7, "b"],
+        [8, "a"],
+      ]);
     } finally {
       store.close();
     }
