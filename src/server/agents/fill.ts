@@ -71,7 +71,21 @@ import { lstat, open, opendir, realpath, type FileHandle } from "fs/promises";
 import { isAbsolute, join, relative, resolve, sep } from "path";
 import type { ProjectConfig } from "../../shared/types.js";
 import type { Decision, DecisionFactValue } from "../../shared/decision-types.js";
-import { blockReason, blockerCleared, limitResetPassed, prOfLine, raiseFacts, readOrNull, taskStateOf, type TaskState } from "./brain-facts.js";
+import {
+  blockReason,
+  blockerCleared,
+  headFacts,
+  limitResetPassed,
+  prOfLine,
+  PrReader,
+  raiseFacts,
+  readOrNull,
+  taskStateOf,
+  type PrHeadSource,
+  type PrHeadView,
+  type TaskState,
+} from "./brain-facts.js";
+import { parsePrRefs } from "../repos/refs.js";
 import type {
   AgentEventKind,
   AgentRunView,
@@ -157,6 +171,8 @@ const QUEUE_LINE_CHARS = 1000;
 const MARK_TAIL_BYTES = 256;
 /** Checks in a row a held line must be gone from the tasks file before its decision is withdrawn */
 export const LINE_GONE_CHECKS = 3;
+/** How long before an escalated chain's start a report may be for its `pr` fact (fill.lastReportPr) */
+export const PR_REPORT_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 
 /** Where a hold's decision stands (AgentsFill.holdDecision) */
 export type HoldDecisionState =
@@ -1155,6 +1171,8 @@ export interface AgentsFillOptions {
    * with `refresh` (decision_policies.live_facts) each check re-reads their live facts. Undefined: off.
    */
   brainFacts?: () => { refresh: ((id: string, facts: Record<string, DecisionFactValue>) => Promise<void>) | null } | undefined;
+  /** Where the v3 facts read a PR at its head (the review module); undefined: not wired, those facts are null */
+  prFacts?: () => PrHeadSource | undefined;
 }
 
 /** How a report or a line reads, for observe mode's comparison: its kind, and the gate a waiting one waits on */
@@ -1210,6 +1228,10 @@ export class AgentsFill {
   private factsLineGone = new Map<string, number>();
   /** The last re-read error logged per decision (decision id -> error) */
   private factsWarned = new Map<string, string>();
+  /** The v3 facts' reads of PRs (bounded, backing off after a failure) */
+  private readonly prReader: PrReader;
+  /** This check's reads of PRs: one per PR */
+  private checkPrs: (pr: number | null) => Promise<PrHeadView | null>;
   /** When fill last saw a waiting run's gate in the gate queue (task|run -> time); the store keeps the first and last sightings */
   private lastQueued = new Map<string, number>();
   /** The unmatched reports of the lines' last runs at the last complete check (rebuilt from the queue each check) */
@@ -1229,7 +1251,10 @@ export class AgentsFill {
   /** G3: when the state check last read a waiting run's target (task|run -> time); none yet: read on the next look */
   private stateChecked = new Map<string, number>();
 
-  constructor(private options: AgentsFillOptions) {}
+  constructor(private options: AgentsFillOptions) {
+    this.prReader = new PrReader(options.project, () => options.prFacts?.(), () => options.probes.clock.now());
+    this.checkPrs = this.prReader.batch();
+  }
 
   /**
    * G3 (wake.events observe or act): a server event that may wake a wait (WAKE_EVENT_TYPES, its key from
@@ -1626,6 +1651,8 @@ export class AgentsFill {
 
   private async evaluate(signal: AbortSignal, now: number): Promise<FillLineView[]> {
     const { project, settings, store, config, probes } = this.options;
+    // The v3 facts read each PR at most once in this check (the raise's read and the re-read share it)
+    this.checkPrs = this.prReader.batch();
     const path = this.tasksPath;
     if (!path) throw new Error("agents.fill.tasks_file is not set");
     const read = await readBounded(path, MAX_TASKS_FILE_BYTES, false);
@@ -2466,6 +2493,72 @@ export class AgentsFill {
     this.lineGone = gone;
   }
 
+  /**
+   * The v3 facts of a gave-up decision fill is about to raise ({} while the decision policies are off, for the
+   * cannot-start codes, and when the decision is already there: the raise would change nothing, so no PR is read).
+   */
+  private async gaveUpRaiseFacts(key: string, task: string, ask: HoldQuestion): Promise<Record<string, DecisionFactValue>> {
+    if (!this.options.brainFacts?.() || ask.code === "probe_failed" || ask.code === "fill_waiting") return {};
+    const known = this.options.findDecision(key);
+    if (known && known.status !== "withdrawn") return {};
+    const pr = ask.report ? readOrNull(() => this.reportPr(ask.report!)) : null;
+    const blockedReason = ask.report?.kind === "blocked" ? (readOrNull(() => this.blockedReason(ask.report!)) ?? undefined) : undefined;
+    const blockedOn = blockedReason !== undefined ? readOrNull(() => this.prRef(blockedReason)) : null;
+    // In parallel, and once per PR in this check (the PR it waits on is often the run's own)
+    const [prView, blockedPrView] = await Promise.all([this.checkPrs(pr), this.checkPrs(blockedOn)]);
+    // Fill raises only for a line of this agent that is not done: its task is open
+    return raiseFacts({
+      code: ask.code,
+      taskState: "open",
+      pr,
+      freshSessions: readOrNull(() => this.options.store.freshSessionsForTask(this.options.project, task)),
+      blockedReason,
+      prOf: (text) => this.prRef(text),
+      loadOk: this.loadOk(),
+      prView,
+      agents: this.agentNames(),
+      blockedPrView,
+      now: this.options.probes.clock.now(),
+    });
+  }
+
+  /** The project's agents (fill's and the configured ones): a hold whose `by` names one is an agent's */
+  private agentNames(): string[] {
+    return [...new Set([...this.options.settings.agents, ...Object.keys(this.options.config.dragons ?? {})])];
+  }
+
+  /**
+   * The PR the task's last WAITING or BLOCKED report by `agent` names, or null. For the agents service's own
+   * escalations: a run that died left none of its own, so a report from the task's earlier runs counts, but only
+   * one made at most PR_REPORT_MAX_AGE_MS before `since` (the escalated chain's start): an old report may name a PR
+   * the task has moved on from (and a PR that merged meanwhile reads no next move).
+   */
+  lastReportPr(task: string, agent: string, since: number): number | null {
+    const kept = this.options.store.listEvents(this.options.project, {
+      kinds: ["fill_waiting", "fill_blocked"],
+      task,
+      agent,
+      since: since - PR_REPORT_MAX_AGE_MS,
+      limit: 1,
+    })[0];
+    if (!kept) return null;
+    return this.reportPr({
+      kind: kept.kind === "fill_waiting" ? "waiting" : "blocked",
+      line: String(kept.data.line ?? ""),
+      wake: null,
+      busId: typeof kept.data.busId === "number" ? kept.data.busId : null,
+      captures: null,
+    });
+  }
+
+  /**
+   * The v3 facts read at a PR's head for the service's own raise: the PR as read (bounded, and null at once while
+   * the reads back off after a failure), and the project's agents
+   */
+  async prHeadFacts(pr: number | null): Promise<{ prView: PrHeadView | null; agents: string[] }> {
+    return { prView: await this.prReader.read(pr), agents: this.agentNames() };
+  }
+
   /** The task's state in the tasks file at the last check (brain-facts.ts taskStateOf), null when no line named it. */
   taskState(task: string, agent: string): TaskState | null {
     return taskStateOf(this.lines, task, agent) ?? null;
@@ -2488,7 +2581,16 @@ export class AgentsFill {
     const gone = new Map<string, number>();
     const warned = new Map<string, string>();
     const now = this.options.probes.clock.now();
-    for (const decision of this.options.openDecisions()) {
+    const agents = this.agentNames();
+    const open = this.options.openDecisions().filter((d) => d.class === "agents.gave_up" && d.evidence && typeof d.evidence.facts.task === "string");
+    // Every PR these decisions name, read at once (one bounded wait per check, however many PRs), once per PR
+    const named = (facts: Record<string, DecisionFactValue>) => [
+      Object.hasOwn(facts, "pr") && typeof facts.pr === "number" ? facts.pr : null,
+      facts.block_target === "pr" && typeof facts.blocked_on_pr === "number" ? facts.blocked_on_pr : null,
+    ];
+    await Promise.all(open.flatMap((d) => named(d.evidence!.facts)).map((pr) => this.checkPrs(pr)));
+    const prs = { read: this.checkPrs };
+    for (const decision of open) {
       const evidence = decision.evidence;
       if (decision.class !== "agents.gave_up" || !evidence || typeof evidence.facts.task !== "string") continue;
       const agent = typeof evidence.facts.agent === "string" ? evidence.facts.agent : null;
@@ -2500,8 +2602,12 @@ export class AgentsFill {
         state = checks >= LINE_GONE_CHECKS ? "closed" : (evidence.facts.task_state ?? null);
       }
       const facts: Record<string, DecisionFactValue> = { task_state: state };
+      // The PR it was raised with, read at its head now (raised while the policies were off: no pr fact, none added)
+      const pr = typeof evidence.facts.pr === "number" ? evidence.facts.pr : null;
+      if (Object.hasOwn(evidence.facts, "pr")) Object.assign(facts, headFacts(pr, await prs.read(pr), agents));
       if (evidence.code === "blocked_reported") {
-        facts.blocker_cleared = blockerCleared(evidence.facts.block_class, evidence.facts.block_target, this.loadOk());
+        const blockedOn = evidence.facts.block_target === "pr" && typeof evidence.facts.blocked_on_pr === "number" ? evidence.facts.blocked_on_pr : null;
+        facts.blocker_cleared = blockerCleared(evidence.facts.block_class, evidence.facts.block_target, this.loadOk(), await prs.read(blockedOn));
       }
       if (evidence.code === "provider_limit") facts.limit_reset_passed = limitResetPassed(evidence.facts.limit_resets_at, now);
       try {
@@ -2527,7 +2633,20 @@ export class AgentsFill {
 
   /** The PR a run's last report names: the bus report's own field, else the line's text. */
   private reportPr(report: RunStatus): number | null {
-    return this.storedReport(report)?.pr ?? prOfLine(report.line);
+    return this.storedReport(report)?.pr ?? this.prRef(report.line);
+  }
+
+  /**
+   * A PR of the project's own repository (`github`, the one the review module reads) that `text` names, as the
+   * repos module reads a report (`PR #12`; `lib PR #7` or `owner/name#7` is another repository's: null). Without
+   * a repositories source, `PR #12` / `pull request #12`.
+   */
+  private prRef(text: string): number | null {
+    const own = this.options.config.github;
+    const source = readOrNull(() => this.options.readyFacts?.());
+    if (!source || !own) return prOfLine(text);
+    const [ref] = parsePrRefs(text.slice(0, 1000), source.repos, { mode: "report", qualified: source.legacy !== true });
+    return ref && ref.repo.toLowerCase() === own.toLowerCase() ? ref.number : null;
   }
 
   /** A BLOCKED report's reason: the bus report's summary, else the line after its first ": " (the planner's reading). */
@@ -2574,6 +2693,7 @@ export class AgentsFill {
     ask: HoldQuestion,
   ): Promise<void> {
     const output = ask.withOutput === false || !latest ? [] : lastOutput(latest);
+    const facts = await this.gaveUpRaiseFacts(key, task, ask);
     await this.options.raise(
       {
         kind: "escalation",
@@ -2612,18 +2732,7 @@ export class AgentsFill {
               task,
               attempt_count: latest?.attempt ?? null,
               last_exit: latest?.exitCode ?? null,
-              // Fill raises only for a line of this agent that is not done: its task is open
-              ...(this.options.brainFacts?.() && ask.code !== "probe_failed" && ask.code !== "fill_waiting"
-                ? raiseFacts({
-                    code: ask.code,
-                    taskState: "open",
-                    pr: ask.report ? readOrNull(() => this.reportPr(ask.report!)) : null,
-                    freshSessions: readOrNull(() => this.options.store.freshSessionsForTask(this.options.project, task)),
-                    blockedReason: ask.report?.kind === "blocked" ? (readOrNull(() => this.blockedReason(ask.report!)) ?? undefined) : undefined,
-                    loadOk: this.loadOk(),
-                    now: this.options.probes.clock.now(),
-                  })
-                : {}),
+              ...facts,
             },
             cause_cleared: false,
             linked_issue: null,

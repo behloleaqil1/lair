@@ -36,6 +36,7 @@ import { mapAuthor } from "./authors.js";
 import { AGENTS_CHANNEL, AgentReviewAssigner, CHECK_INTERVAL_MS } from "./agent-assigner.js";
 import { hashToken, newAssignmentToken } from "./tokens.js";
 import { ACTIVE_STATES } from "../agents/types.js";
+import type { PrHeadView } from "../agents/brain-facts.js";
 import { checkTestIntegrity, isTestFile, type IntegrityFile } from "./integrity.js";
 import { GitHubHost, tokenFrom, type FetchLike, type TokenSource } from "./github.js";
 import type { GitHost, HostFile, HostPullRequest, HostRepo } from "./host.js";
@@ -591,6 +592,34 @@ export class ReviewService {
       commitShas: (await host.listCommits(n)).map((c) => c.sha),
       gate: required.length === 0 ? null : required.map((g) => ({ name: g.name, status: g.status })),
       findingIds,
+    };
+  }
+
+  /**
+   * The decision brain's view of a PR (src/server/agents/brain-facts.ts PrHeadView): its state and head read from
+   * the host now, each reviewer's latest verdict at exactly that head (as the merge policy counts them; a check's
+   * request for changes and an open blocking finding count as one), each required gate there, and the unreleased
+   * holds on it. Read only: nothing is recorded, not even the head (a read must not withdraw reviews).
+   */
+  async brainPrFacts(n: number): Promise<PrHeadView> {
+    const pr = await this.o.host.getPullRequest(n);
+    // As the merge policy reads them (evaluate): each reviewer's latest review, only at this head
+    const reviews = this.annotate(this.o.store.listReviews(this.project, n), pr.headSha);
+    const current = reviews.filter((r) => !r.stale && !r.superseded);
+    const verdicts = current
+      // Lair's own checks (test integrity) only ever hold a PR back: their request for changes counts, never an approval
+      .filter((r) => r.reviewer.kind !== "check" || r.verdict === "request_changes")
+      .map((r) => r.verdict);
+    // An open blocking finding the merge policy still refuses on is a request for changes too
+    const blocking = reviews.some((r) => r.findings.some((f) => f.status === "open" && f.blocking && !f.superseded));
+    if (blocking) verdicts.push("request_changes");
+    const required = await this.gateSource.checksAt(pr.headSha);
+    return {
+      state: pr.state,
+      headSha: pr.headSha,
+      verdicts,
+      gate: required.length === 0 ? null : required.map((g) => g.status),
+      holds: this.o.store.activeHolds(this.project, n).map((h) => ({ byOwner: h.byOwner === true, by: h.createdBy })),
     };
   }
 
@@ -2000,6 +2029,12 @@ export class ReviewManager {
     if (found.recorded) return { verdict: "productive", headSha: found.headSha };
     const now = (this.options.clock ?? systemClock).now();
     return { verdict: now < until ? "pending" : "idle", headSha: found.headSha };
+  }
+
+  /** The decision brain's view of a project's PR (ReviewService.brainPrFacts); null when the project has no reviews. */
+  async brainPrFacts(project: string, pr: number): Promise<PrHeadView | null> {
+    const service = this.services.get(project);
+    return service ? service.brainPrFacts(pr) : null;
   }
 
   /** AI spend: a PR's head as the review store last read it (null: unknown). */

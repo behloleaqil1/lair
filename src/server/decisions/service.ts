@@ -33,7 +33,7 @@ import type {
   RaisedVia,
 } from "./store.js";
 import { SecretStoreUnavailableError, type SecretStore } from "./secrets.js";
-import { isFactValue, liveFactsOf } from "./structure.js";
+import { isFactValue, liveFactsOf, MAX_EVIDENCE_FACTS } from "./structure.js";
 import { DecisionError, parseAnswerInput, parseRaiseInput, parseWithdrawInput } from "./validate.js";
 import type {
   AnswerContext,
@@ -314,6 +314,10 @@ export class DecisionInbox implements DecisionProducer {
       const old = Object.hasOwn(before.facts, name) ? before.facts[name] : null;
       if (old !== value) changes.push(`${name} ${String(old)} -> ${String(value)}`);
       nextFacts[name] = value;
+    }
+    // The raise's cap holds after an update too: a live fact the raise did not carry adds one
+    if (Object.keys(nextFacts).length > MAX_EVIDENCE_FACTS) {
+      throw new DecisionError(400, `Invalid update: the evidence would hold more than ${MAX_EVIDENCE_FACTS} facts`);
     }
     const next = {
       ...before,

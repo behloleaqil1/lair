@@ -991,6 +991,10 @@ agents.useWakeFacts({
   message: async (project, agent, since) => (await existingBusStore(project, busDataDir))?.unreadSince(agent, since) ?? null,
 });
 
+// Decision brain v3 (docs/design/decision-brain.md §4.1): a gave-up decision's PR read at its head (review, gate and
+// hold there, merged or closed), only while decision_policies.enabled is on. Read only
+agents.usePrFacts({ pr: (project, pr) => reviews.brainPrFacts(project, pr) });
+
 // Live config reload (src/server/reload/): a changed project file reaches
 // the modules whose part of it changed, without a restart; an invalid one
 // keeps the previous config running and shows in the dashboard's banner

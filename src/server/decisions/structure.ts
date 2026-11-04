@@ -84,12 +84,15 @@ const FactValue = z.union([
   z.null(),
 ]);
 
+/** The most facts one decision's evidence holds, at the raise and after any update */
+export const MAX_EVIDENCE_FACTS = 30;
+
 export const EvidenceSchema = z
   .object({
     code: z.string().regex(CODE, "use lowercase letters, digits and '_', starting with a letter (at most 60)"),
     facts: z
       .record(z.string().regex(FACT_KEY, "fact names use lowercase letters, digits and '_'"), FactValue)
-      .refine((facts) => Object.keys(facts).length <= 30, "at most 30 facts"),
+      .refine((facts) => Object.keys(facts).length <= MAX_EVIDENCE_FACTS, `at most ${MAX_EVIDENCE_FACTS} facts`),
     cause_cleared: z.boolean(),
     linked_issue: z.number().int().positive().nullable(),
   })
