@@ -13,7 +13,7 @@ import {
   EXIT_UNAVAILABLE,
   type BusCliDeps,
 } from "./bus.js";
-import { newBusToken } from "../server/bus/tokens.js";
+import { newBusToken, newExtToken } from "../server/bus/tokens.js";
 
 class Capture {
   stdout = "";
@@ -88,7 +88,7 @@ describe("bus CLI", () => {
       let capturedBody: { tool: string; args: unknown } | null = null;
       const code = await busCli(["whoami"], deps({
         fetch: async (_url, init) => {
-          capturedBody = JSON.parse(init.body);
+          capturedBody = JSON.parse(init.body ?? "");
           return { status: 200, text: async () => '{"success":true,"data":{"agent":"worker-a","task":"feat-x"}}' };
         },
       }));
@@ -115,7 +115,7 @@ describe("bus CLI", () => {
         ["report", "--kind", "DONE", "--task", "feat-search", "--summary-file", summaryFile],
         deps({
           fetch: async (_url, init) => {
-            capturedBody = JSON.parse(init.body);
+            capturedBody = JSON.parse(init.body ?? "");
             return { status: 200, text: async () => '{"success":true,"data":{"id":1}}' };
           },
         }),
@@ -137,7 +137,7 @@ describe("bus CLI", () => {
         ["report", "--kind", "WAITING", "--task", "feat-x", "--summary-file", summaryFile, "--gate", "gate-123", "--pr", "42", "--sha", "abc1234"],
         deps({
           fetch: async (_url, init) => {
-            capturedBody = JSON.parse(init.body);
+            capturedBody = JSON.parse(init.body ?? "");
             return { status: 200, text: async () => '{"success":true,"data":{"id":2}}' };
           },
         }),
@@ -176,7 +176,7 @@ describe("bus CLI", () => {
       let capturedBody: { tool: string } | null = null;
       const code = await busCli(["inbox"], deps({
         fetch: async (_url, init) => {
-          capturedBody = JSON.parse(init.body);
+          capturedBody = JSON.parse(init.body ?? "");
           return { status: 200, text: async () => '{"success":true,"data":[]}' };
         },
       }));
@@ -199,7 +199,7 @@ describe("bus CLI", () => {
         ["ack", "--message", "msg-123", "--note", "Done!"],
         deps({
           fetch: async (_url, init) => {
-            capturedBody = JSON.parse(init.body);
+            capturedBody = JSON.parse(init.body ?? "");
             return { status: 200, text: async () => '{"success":true,"data":{"message_id":"msg-123"}}' };
           },
         }),
@@ -231,7 +231,7 @@ describe("bus CLI", () => {
         ["send", "--to", "orchestrator", "--text", "Need help", "--priority", "8"],
         deps({
           fetch: async (_url, init) => {
-            capturedBody = JSON.parse(init.body);
+            capturedBody = JSON.parse(init.body ?? "");
             return { status: 200, text: async () => '{"success":true,"data":{"message_id":"x","to":"orchestrator"}}' };
           },
         }),
@@ -250,7 +250,7 @@ describe("bus CLI", () => {
       let capturedBody: { tool: string } | null = null;
       const code = await busCli(["board"], deps({
         fetch: async (_url, init) => {
-          capturedBody = JSON.parse(init.body);
+          capturedBody = JSON.parse(init.body ?? "");
           return { status: 200, text: async () => '{"success":true,"data":{"tasks":[],"agents":[]}}' };
         },
       }));
@@ -294,6 +294,67 @@ describe("bus CLI", () => {
       expect(code).toBe(EXIT_REFUSED);
       expect(capture.stderr).not.toContain(token);
       expect(capture.stderr).toContain("[bus-token]");
+    });
+  });
+
+  describe("external worker tokens", () => {
+    const SESSION = "s".repeat(43);
+
+    it("report takes an external worker's token as LAIR_BUS_TOKEN", async () => {
+      const summaryFile = join(tempDir, "summary.txt");
+      writeFileSync(summaryFile, "halfway\n");
+      const token = newExtToken();
+      let sent: { url: string; authorization?: string } | null = null;
+      const code = await busCli(["report", "--kind", "PROGRESS", "--task", "feat-search", "--summary-file", summaryFile], deps({
+        env: { LAIR_BUS_TOKEN: token },
+        fetch: async (url, init) => {
+          sent = { url, authorization: init.headers.authorization };
+          return { status: 200, text: async () => '{"success":true,"data":{"id":1}}' };
+        },
+      }));
+      expect(code).toBe(EXIT_OK);
+      expect(sent).toEqual({ url: "http://127.0.0.1:4777/api/bus/call", authorization: `Bearer ${token}` });
+    });
+
+    it("token commands need LAIR_OWNER_SESSION, not LAIR_BUS_TOKEN", async () => {
+      const code = await busCli(["token", "list", "--project", "example"], deps({ env: { LAIR_BUS_TOKEN: newBusToken() } }));
+      expect(code).toBe(EXIT_USAGE);
+      expect(capture.stderr).toContain("LAIR_OWNER_SESSION is not set");
+    });
+
+    it("token list is a GET with no body and the owner session as the dashboard sends it, never printed", async () => {
+      const sent: Array<{ url: string; init: Parameters<BusCliDeps["fetch"]>[1] }> = [];
+      const code = await busCli(["token", "list", "--project", "example"], deps({
+        env: { LAIR_OWNER_SESSION: SESSION },
+        fetch: async (url, init) => {
+          sent.push({ url, init });
+          return { status: 403, text: async () => `{"success":false,"error":"refused for ${SESSION}"}` };
+        },
+      }));
+      expect(code).toBe(EXIT_REFUSED);
+      expect(sent).toHaveLength(1);
+      expect(sent[0].url).toBe("http://127.0.0.1:4777/api/bus/tokens?project=example");
+      expect(sent[0].init.method).toBe("GET");
+      expect(sent[0].init.body).toBeUndefined();
+      expect(sent[0].init.headers).toEqual({ "x-lair-owner-session": SESSION, origin: "http://127.0.0.1:4777", "sec-fetch-site": "same-origin" });
+      expect(capture.stderr).toContain("refused for [owner-session]");
+      expect(capture.stderr).not.toContain(SESSION);
+    });
+
+    it("token create checks --ttl and --kinds, and revoke its id, before sending anything", async () => {
+      let calls = 0;
+      const fetch = async () => {
+        calls++;
+        return { status: 201, text: async () => '{"success":true,"data":{}}' };
+      };
+      const env = { LAIR_OWNER_SESSION: SESSION };
+      expect(await busCli(["token", "create", "--project", "example", "--worker", "worker-x", "--ttl", "1y"], deps({ env, fetch }))).toBe(EXIT_USAGE);
+      expect(await busCli(["token", "create", "--project", "example", "--worker", "worker-x", "--kinds", "PROGRESS,READY"], deps({ env, fetch }))).toBe(EXIT_USAGE);
+      expect(await busCli(["token", "revoke", "--project", "example"], deps({ env, fetch }))).toBe(EXIT_USAGE);
+      expect(calls).toBe(0);
+      expect(capture.stderr).toContain("--ttl must be minutes, hours or days");
+      expect(capture.stderr).toContain("--kinds must be some of");
+      expect(capture.stderr).toContain("revoke needs the token's id");
     });
   });
 });

@@ -760,6 +760,9 @@ const triage = await mountTriage(fastify, {
   defaultProject: () => getDefaultProject(),
   owner: humanAuth,
   review: reviews,
+  // triage.external_author: tasks_file (off by default): a result that names no agent gets its author from fill's
+  // tasks file lines, as fill's last check read them
+  adapters: (project) => ({ taskLines: () => agents.get(project)?.fillStatus() ?? null }),
 });
 triage.useDecisions(decisionInbox);
 

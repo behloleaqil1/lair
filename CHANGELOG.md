@@ -5,6 +5,10 @@ file lists what needs action on your side.
 
 ## Unreleased
 
+- **External worker tokens.** A worker outside Lair's runs can report over the bus with a token you make
+  (`lair bus token create --project <p> --worker <id>`, with an owner session): reports only, as `ext:<worker>`, with
+  an expiry, the kinds you allow, a rate limit and an audit. Each project's bus store gets two tables (schema 2,
+  added when the store is opened; nothing to do). See [External worker tokens](docs/configuration.md#external-worker-tokens).
 - **Host services (off by default).** `host_services:` in a project config probes the services work needs on each
   machine (a container engine, a tunnel daemon). In `act` mode Lair starts a service that is down (a grace window,
   then a doubling backoff, at most `max_start_attempts` per outage) and holds the pipeline jobs whose lane needs it;
