@@ -8475,6 +8475,24 @@ describe("AI spend G3: waiting agents woken by the awaited event (docs/design/ai
     expect(eventsOf(h, "fill_gate_queued")).toEqual([]);
   });
 
+  it("#347 L4: observe: a line naming a PR and a gate in the gate queue still waits on the gate (the timer runs in observe): held, not counted", async () => {
+    const h = setup(g3("observe", {}, { file: "{gates_dir}/results/{wake}.rc" }));
+    fillTask(h);
+    const gate = "20260302T120030Z-feat-login-abcdef12-1";
+    await runEndingWith(h, `- WAITING feat-login PR 12 by worker-a 12:01Z: gate queued [${gate}] [bus:1]`, async () => {
+      mkdirSync(join(h.gatesDir, "queue"), { recursive: true });
+      const req = join(h.gatesDir, "queue", `remote.1.${gate}.req`);
+      writeFileSync(req, "feat-login\nabcdef12\n./gate.sh\n");
+      const t = new Date(NOW + 30 * SEC);
+      utimesSync(req, t, t);
+    });
+    h.clock.t = NOW + 2 * MIN;
+    const line = await check(h);
+    expect(line).toMatchObject({ state: "held", hold: "waiting", waiting: { queued: { gate } } });
+    expect(line.detail).not.toContain("counted as a run without progress");
+    expect(eventsOf(h, "fill_gate_queued").map((e) => e.data.own)).toEqual([true]);
+  });
+
   /** Fill starts feat-login at NOW (pid 5001), which (after `during`) writes `queueLine` and exits 0; the tick at +1 min sees it end. */
   async function runEndingWith(h: Harness, queueLine: string, during?: () => Promise<void>): Promise<AgentRun> {
     await check(h);
