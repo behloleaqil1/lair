@@ -243,6 +243,8 @@ export class SpendClassifier {
     const kinds = new Set(
       this.o.store
         .listEvents(this.o.project, { kinds: ["fill_wake_absent", "fill_gate_queued", "fill_woken", "fill_weak"], task: run.task, runId: run.id, limit: 10 })
+        // A gate queued before the run's chain started is not its own wait (own: false), as fill counts it (#347)
+        .filter((e) => e.kind !== "fill_gate_queued" || e.data.own !== false)
         .map((e) => e.kind),
     );
     if (kinds.has("fill_weak")) return verdict("idle", "waiting_unnamed");

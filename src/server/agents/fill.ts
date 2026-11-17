@@ -35,7 +35,7 @@
  *   - waiting: its last run exited 0 on a WAITING line. With a (?<wake>...)
  *     capture and fill.wake.file (a plain name, inside wake.root) it starts
  *     again once that file appears (a gate's result, say), with no backoff
- *     and nothing counted. Without a capture (and no G3 event named), a
+ *     and nothing counted. Without a capture (and no G3 event named in act), a
  *     word of the line that is a gate in the gate queue queued since the
  *     run's chain started (or whose wake.file came after it started) is its
  *     wake; without wake.file, such a gate is waited on while it is in the
@@ -3075,8 +3075,8 @@ export class AgentsFill {
   /**
    * The gate a waiting line names when its pattern captured no wake (#347;
    * a mirrored bus line puts it after "by <agent>" and a summary of up to
-   * 2000 characters). None for a line that names an event G3 waits on (a
-   * PR, a decision, a bus message): it waits for that. Else the one fill saw
+   * 2000 characters). None for a line that names an event G3 waits on in
+   * act (a PR, a decision, a bus message): it waits for that. Else the one fill saw
    * in the gate queue for this run before, queued since its chain started
    * (fill_gate_queued with own, so it holds once the gate left the queue
    * and across restarts), else the first of the whole line's words that are
@@ -3094,7 +3094,8 @@ export class AgentsFill {
    */
   private async gateInLine(run: AgentRun, task: string, status: RunStatus, gateQueue: () => Promise<Map<string, QueuedRequest>>): Promise<string | null> {
     const { settings } = this.options;
-    if (settings.wake.events.mode !== "off" && wakeTargetOf(status.captures).target !== null) return null;
+    // act only: there it waits for that event; in observe the timer runs as before, so its gate still counts (#347)
+    if (settings.wake.events.mode === "act" && wakeTargetOf(status.captures).target !== null) return null;
     const kept = this.ownQueuedEvent(task, run.id);
     if (kept) {
       const gate = typeof kept.data.requeuedFrom === "string" ? kept.data.requeuedFrom : kept.data.gate;
