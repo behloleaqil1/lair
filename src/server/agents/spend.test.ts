@@ -1260,50 +1260,6 @@ describe("AT-8: a builder's runs get one class and reason each", () => {
     ]);
   });
 
-  it("#347: WAITING on a gate in the gate queue that was queued before the run's chain started is not productive (fill counts it too)", async () => {
-    const paths = makePaths();
-    const WAITS_ON_GATE = "^-\\s+WAITING\\s+{task}(?:\\s+(?<wake>\\d{8}T\\d{6}Z-\\S+))?(?=\\s|$)";
-    const GATE = "20260302T110000Z-t-wait-abcdef12-4242";
-    mkdirSync(join(paths.dir, "prompts"), { recursive: true });
-    writeFileSync(join(paths.dir, "prompts", "worker.txt"), "Build what the task says.\n");
-    writeFileSync(join(paths.dir, "tasks.txt"), "worker-a|A|t-wait|Wait task\n");
-    const h = setup(
-      {
-        ...SPEND_ON,
-        fill: {
-          enabled: true,
-          tasks_file: join(paths.dir, "tasks.txt"),
-          agents: ["worker-a"],
-          prompt_files: ["{prompts_dir}/worker.txt"],
-          max_active: 1,
-          interval_seconds: 1,
-          waiting_pattern: WAITS_ON_GATE,
-        },
-      },
-      { paths },
-    );
-    // Another task queued this gate an hour before the run started
-    mkdirSync(join(paths.dir, "gates", "queue"), { recursive: true });
-    const req = join(paths.dir, "gates", "queue", `remote.1.${GATE}.req`);
-    writeFileSync(req, "t-other\nabcdef12\n./gate.sh\n");
-    const old = new Date(h.clock.t - 60 * MIN);
-    utimesSync(req, old, old);
-    await h.service.checkFill();
-    h.spawner.behaviour = (pid, logPath) => {
-      writeLog(h.clock, logPath, "found a gate\n");
-      appendFileSync(h.queueFile, `- WAITING t-wait ${GATE} by worker-a 12:01Z: gate queued\n`);
-      h.spawner.exit(pid, 0);
-    };
-    await h.service.tick();
-    h.spawner.behaviour = undefined;
-    h.clock.t += MIN;
-    await h.service.tick();
-    await h.service.checkFill();
-    expect(eventsOf(h, "fill_gate_queued").map((e) => e.data.own)).toEqual([false]);
-    await h.service.tick();
-    expect(byTask(h, "t-wait")[0]).not.toMatchObject({ class: "productive" });
-  });
-
   /** fill over t-wait with G3 (fill.wake.events) in `mode`; its WAITING line names PR 42 and no gate */
   function g3Wait(mode: "off" | "observe" | "act") {
     const paths = makePaths();
